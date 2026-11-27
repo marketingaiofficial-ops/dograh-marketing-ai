@@ -5,6 +5,7 @@ import { getTurnCredentialsApiV1TurnCredentialsGet, validateUserConfigurationsAp
 import { TurnCredentialsResponse } from "@/client/types.gen";
 import { WorkflowValidationError } from "@/components/flow/types";
 import type { ConversationNodeTransitionItem, RealtimeFeedbackMessage as FeedbackMessage } from "@/components/workflow/conversation";
+import { isLlmTtfb } from "@/components/workflow/conversation/adapters/fromRealtimeFeedback";
 import { useAppConfig } from "@/context/AppConfigContext";
 import { resolveBrowserBackendUrl } from '@/lib/apiClient';
 import { detailFromError } from '@/lib/apiError';
@@ -39,6 +40,11 @@ const HANDLED_SERVICE_ERROR_TYPES = new Set([
     'quota_check_failed',
 ]);
 
+// Errors meaning this run can never be called again. Retrying reaches the same
+// refusal, so the session is closed out as completed and the caller is left to
+// start a fresh run rather than being offered a retry that cannot succeed.
+const SPENT_RUN_ERROR_TYPES = new Set(['workflow_run_already_completed']);
+
 export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initialContextVariables, onNodeTransition }: UseWebSocketRTCProps) => {
     const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('idle');
     const [connectionActive, setConnectionActive] = useState(false);
@@ -51,7 +57,7 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
     const [isStarting, setIsStarting] = useState(false);
     const [feedbackMessages, setFeedbackMessages] = useState<FeedbackMessage[]>([]);
     const initialContext = initialContextVariables || {};
-    const { config: appConfig } = useAppConfig();
+    const { config: appConfig, loading: appConfigLoading, refresh: refreshAppConfig } = useAppConfig();
 
     const {
         audioInputs,
@@ -202,7 +208,9 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
         // Build ICE servers list
         const iceServers: RTCIceServer[] = [];
 
-        if (useStun) {
+        // A `stun:` entry can only yield srflx, never relay — and srflx has been
+        // seen leaking through iceTransportPolicy: 'relay', so skip it entirely.
+        if (useStun && !appConfig?.forceTurnRelay) {
             iceServers.push({ urls: ['stun:stun.l.google.com:19302'] });
         }
 
@@ -393,6 +401,15 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
 
                                 // Stop the connection and surface the handled service error.
                                 cleanupConnection({ graceful: false, status: 'failed' });
+                            } else if (SPENT_RUN_ERROR_TYPES.has(message.payload?.error_type)) {
+                                logger.info('Run is no longer callable:', message.payload.message);
+                                setPermissionError(
+                                    message.payload?.message || 'This test run has already finished.'
+                                );
+                                // Completed rather than failed: the run did its
+                                // work, so the footer offers a new test instead
+                                // of a retry that would be refused again.
+                                cleanupConnection({ graceful: true, status: 'idle' });
                             } else {
                                 const serverErrorMessage = message.payload?.message || 'Server error';
                                 logger.error('Server error:', message.payload);
@@ -546,7 +563,13 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
                         }
 
                         case 'rtf-ttfb-metric': {
-                            const { ttfb_seconds, processor, model } = message.payload;
+                            const { ttfb_seconds, processor, model, kind } = message.payload;
+                            // Only the LLM's TTFB is shown (as reasoning delay). STT and TTS
+                            // TTFB can arrive mid-reply, and any message between two bot-text
+                            // chunks splits the bot bubble.
+                            if (!isLlmTtfb(kind)) {
+                                break;
+                            }
                             setFeedbackMessages(prev => [...prev, {
                                 id: `ttfb-${Date.now()}`,
                                 type: 'ttfb-metric',
@@ -699,9 +722,6 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
                 headers: {
                     'Authorization': `Bearer ${accessToken}`,
                 },
-                query: {
-                    validity_ttl_seconds: 86400
-                },
             });
 
             if (response.error) {
@@ -828,6 +848,12 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
         audioInputs,
         selectedAudioInput,
         setSelectedAudioInput,
+        // Auto-starting callers must wait on both: /api/config/version resolves
+        // 200 even when its backend healthcheck failed, defaulting forceTurnRelay
+        // to false, so only a 'reachable' backendStatus confirms the real value.
+        appConfig,
+        appConfigLoading,
+        refreshAppConfig,
         connectionActive,
         permissionError,
         isCompleted,

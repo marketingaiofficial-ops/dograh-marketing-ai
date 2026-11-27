@@ -22,13 +22,17 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from api.constants import ENABLE_COTURN, FORCE_TURN_RELAY
 from api.db import db_client
-from api.enums import WorkflowRunMode
+from api.enums import CallType, WorkflowRunMode
 from api.routes.turn_credentials import (
     TURN_SECRET,
     TurnCredentialsResponse,
     generate_turn_credentials,
 )
-from api.schemas.embed_chat import PublicEmbedChatSessionResponse
+from api.schemas.embed_chat import (
+    PublicEmbedChatSessionResponse,
+    PublicEmbedChatStreamEvent,
+)
+from api.schemas.widget_texts import WidgetTexts
 from api.services.workflow.embed_chat_limiter import allow_embed_chat_init
 from api.services.workflow.embed_context import sanitize_embed_context_variables
 from api.services.workflow.embed_session_service import (
@@ -42,6 +46,7 @@ from api.services.workflow.embed_session_service import (
 from api.services.workflow.embed_text_chat_service import (
     build_public_chat_session_response,
     start_embed_text_chat,
+    stream_embed_text_chat_turn,
 )
 from api.services.workflow.run_creation import prepare_workflow_run_inputs
 from api.services.workflow.text_chat_session_service import (
@@ -49,6 +54,7 @@ from api.services.workflow.text_chat_session_service import (
     TextChatSessionExecutionError,
     TextChatSessionRevisionConflictError,
 )
+from api.services.workflow.text_chat_stream import TextChatEventStreamResponse
 
 router = APIRouter(prefix="/public/embed")
 
@@ -85,6 +91,9 @@ class EmbedConfigResponse(BaseModel):
 
     workflow_id: int
     settings: dict
+    # Visitor-facing copy, already resolved against the agent owner's overrides.
+    # The widget renders these verbatim and holds no defaults of its own.
+    texts: WidgetTexts
     theme: str
     position: str
     button_text: str
@@ -179,7 +188,7 @@ async def build_public_embed_preflight_response(
     """Handle embed preflights before global CORSMiddleware rejects external sites."""
     public_embed_prefix = f"{api_prefix.rstrip('/')}/public/embed"
 
-    if path == f"{public_embed_prefix}/init":
+    if path in {f"{public_embed_prefix}/init", f"{public_embed_prefix}/init/stream"}:
         if requested_method.upper() != "POST":
             return Response(status_code=405)
         return _cors_response(origin, "POST, OPTIONS")
@@ -272,6 +281,29 @@ class PublicEmbedCORSMiddleware:
 async def initialize_embed_session(
     request: Request, init_request: InitEmbedRequest, response: Response
 ):
+    return await _initialize_embed_session(request, init_request, response)
+
+
+@router.post(
+    "/init/stream",
+    response_class=TextChatEventStreamResponse,
+    responses={200: {"model": PublicEmbedChatStreamEvent}},
+)
+async def stream_initialize_embed_chat(
+    request: Request, init_request: InitEmbedRequest, response: Response
+):
+    return await _initialize_embed_session(
+        request, init_request, response, stream_response=True
+    )
+
+
+async def _initialize_embed_session(
+    request: Request,
+    init_request: InitEmbedRequest,
+    response: Response,
+    *,
+    stream_response: bool = False,
+):
     """Initialize an embed session with token validation and domain checking.
 
     This endpoint:
@@ -312,6 +344,8 @@ async def initialize_embed_session(
         "chat" if (embed_token.settings or {}).get("widgetType") == "chat" else "voice"
     )
     is_chat = widget_type == "chat"
+    if stream_response and not is_chat:
+        raise HTTPException(status_code=400, detail="Not a chat widget")
 
     # Chat initialization immediately performs billable greeting work. Keep it
     # in an isolated token-scoped rate bucket so anonymous bursts cannot fan
@@ -356,6 +390,8 @@ async def initialize_embed_session(
             initial_context = {
                 **context_variables,
                 "provider": WorkflowRunMode.SMALLWEBRTC.value,
+                # Embed visitors initiate the voice call into the workflow.
+                "direction": CallType.INBOUND.value,
             }
         workflow_run = await db_client.create_workflow_run(
             name=name,
@@ -363,6 +399,7 @@ async def initialize_embed_session(
             mode=mode,
             user_id=embed_token.created_by,  # Use token creator as run owner
             organization_id=embed_token.organization_id,
+            call_type=CallType.INBOUND,
             initial_context=initial_context,
             definition_id=run_inputs.definition_id,
         )
@@ -393,11 +430,9 @@ async def initialize_embed_session(
         logger.error(f"Failed to create embed session: {e}")
         raise HTTPException(status_code=500, detail="Failed to create session")
 
-    # For chat widgets, seed the text session and run the greeting turn
-    # synchronously so the widget opens with the agent's first message. Quota is
-    # checked first — before any LLM spend — mirroring the authenticated
-    # text-chat create flow. (Voice runs are quota-checked later, on the
-    # signaling WebSocket.)
+    # Seed the greeting turn after quota authorization. The streaming endpoint
+    # delivers speech as it arrives; the JSON endpoint awaits the full turn.
+    # Voice runs are quota-checked later on the signaling WebSocket.
     chat_session = None
     if is_chat:
         set_current_run_id(workflow_run.id)
@@ -411,7 +446,9 @@ async def initialize_embed_session(
             )
         try:
             text_session = await start_embed_text_chat(
-                workflow_id=embed_token.workflow_id, run_id=workflow_run.id
+                workflow_id=embed_token.workflow_id,
+                run_id=workflow_run.id,
+                defer_execution=stream_response,
             )
         except (
             TextChatSessionRevisionConflictError,
@@ -421,6 +458,14 @@ async def initialize_embed_session(
             # Public surface: log the specifics, return a generic detail.
             logger.error(f"Embed chat greeting failed for run {workflow_run.id}: {e}")
             raise HTTPException(status_code=500, detail="Assistant failed to respond")
+        if stream_response:
+            response = TextChatEventStreamResponse(
+                stream_embed_text_chat_turn(text_session, session_token=session_token),
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+            if origin:
+                _allow_embed_origin(response, origin)
+            return response
         chat_session = build_public_chat_session_response(text_session)
 
     # Prepare configuration
@@ -483,6 +528,7 @@ async def get_embed_config(token: str, request: Request, response: Response):
     return EmbedConfigResponse(
         workflow_id=embed_token.workflow_id,
         settings=settings,
+        texts=WidgetTexts.resolve(settings),
         theme=settings.get("theme", "light"),
         position=settings.get("position", "bottom-right"),
         button_text=settings.get("buttonText", "Start Voice Call"),
@@ -495,6 +541,7 @@ async def get_embed_config(token: str, request: Request, response: Response):
 
 
 @router.options("/init")
+@router.options("/init/stream")
 async def options_init(request: Request):
     """Fallback OPTIONS handler for init endpoint."""
     # Browser preflights are handled by PublicEmbedCORSMiddleware before global CORS.

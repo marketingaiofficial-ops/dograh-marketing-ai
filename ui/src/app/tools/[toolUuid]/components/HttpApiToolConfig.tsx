@@ -2,8 +2,6 @@
 
 import { Info } from "lucide-react";
 
-import type { RecordingResponseSchema } from "@/client/types.gen";
-import { StaticTextWarning, TextOrAudioInput } from "@/components/flow/TextOrAudioInput";
 import {
     CredentialSelector,
     extractUrlHostnameParameters,
@@ -18,11 +16,22 @@ import {
     type ToolParameter,
     UrlInput,
 } from "@/components/http";
+import { BodyTemplateEditor } from "@/components/http/body-template-editor";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+
+export type HttpBodyFormat = "json" | "form";
 
 export interface HttpApiToolConfigProps {
     name: string;
@@ -41,15 +50,15 @@ export interface HttpApiToolConfigProps {
     onParametersChange: (parameters: ToolParameter[]) => void;
     presetParameters: PresetToolParameter[];
     onPresetParametersChange: (parameters: PresetToolParameter[]) => void;
+    bodyTemplateEnabled: boolean;
+    onBodyTemplateEnabledChange: (enabled: boolean) => void;
+    bodyTemplate: Record<string, unknown> | null;
+    onBodyTemplateChange: (template: Record<string, unknown> | null) => void;
+    onBodyTemplateValidityChange: (valid: boolean) => void;
+    bodyFormat: HttpBodyFormat;
+    onBodyFormatChange: (format: HttpBodyFormat) => void;
     timeoutMs: number;
     onTimeoutMsChange: (timeout: number) => void;
-    customMessage: string;
-    onCustomMessageChange: (message: string) => void;
-    customMessageType: 'text' | 'audio';
-    onCustomMessageTypeChange: (type: 'text' | 'audio') => void;
-    customMessageRecordingId: string;
-    onCustomMessageRecordingIdChange: (id: string) => void;
-    recordings?: RecordingResponseSchema[];
 }
 
 export function HttpApiToolConfig({
@@ -69,15 +78,15 @@ export function HttpApiToolConfig({
     onParametersChange,
     presetParameters,
     onPresetParametersChange,
+    bodyTemplateEnabled,
+    onBodyTemplateEnabledChange,
+    bodyTemplate,
+    onBodyTemplateChange,
+    onBodyTemplateValidityChange,
+    bodyFormat,
+    onBodyFormatChange,
     timeoutMs,
     onTimeoutMsChange,
-    customMessage,
-    onCustomMessageChange,
-    customMessageType,
-    onCustomMessageTypeChange,
-    customMessageRecordingId,
-    onCustomMessageRecordingIdChange,
-    recordings = [],
 }: HttpApiToolConfigProps) {
     const urlHostnameParameters = extractUrlHostnameParameters(url);
     const urlPathParameters = extractUrlPathParameters(url);
@@ -171,30 +180,6 @@ export function HttpApiToolConfig({
                                 </div>
                             )}
                         </div>
-
-                        <div className="grid gap-2 pt-4 border-t">
-                            <Label>Custom Message</Label>
-                            <Label className="text-xs text-muted-foreground">
-                                Optional message the AI will speak or play before executing this tool.
-                            </Label>
-                            <TextOrAudioInput
-                                type={customMessageType}
-                                onTypeChange={onCustomMessageTypeChange}
-                                recordingId={customMessageRecordingId}
-                                onRecordingIdChange={onCustomMessageRecordingIdChange}
-                                recordings={recordings}
-                            >
-                                <>
-                                    <StaticTextWarning />
-                                    <Textarea
-                                        value={customMessage}
-                                        onChange={(e) => onCustomMessageChange(e.target.value)}
-                                        placeholder="e.g., Let me check that for you, one moment please."
-                                        rows={2}
-                                    />
-                                </>
-                            </TextOrAudioInput>
-                        </div>
                     </TabsContent>
 
                     <TabsContent value="auth" className="space-y-4 mt-4">
@@ -209,7 +194,7 @@ export function HttpApiToolConfig({
                             <Label>LLM Parameters</Label>
                             <Label className="text-xs text-muted-foreground">
                                 Define the parameters that the LLM will provide when calling this tool.
-                                These will be sent as JSON body for POST/PUT/PATCH or as URL query params for GET/DELETE.
+                                These will be sent in the request body for POST/PUT/PATCH or as URL query params for GET/DELETE.
                             </Label>
                             <ParameterEditor
                                 parameters={parameters}
@@ -228,6 +213,54 @@ export function HttpApiToolConfig({
                                 onChange={onPresetParametersChange}
                             />
                         </div>
+
+                        {["POST", "PUT", "PATCH"].includes(httpMethod) && (
+                            <div className="grid gap-4 pt-4 border-t">
+                                <div className="grid gap-2">
+                                    <Label htmlFor="body-format">Body Format</Label>
+                                    <p className="text-xs text-muted-foreground">
+                                        How the request body is encoded. Use form-encoded only for APIs that
+                                        reject JSON; lists repeat the field name and objects are sent as JSON strings.
+                                    </p>
+                                    <Select
+                                        value={bodyFormat}
+                                        onValueChange={(value) => onBodyFormatChange(value as HttpBodyFormat)}
+                                    >
+                                        <SelectTrigger id="body-format">
+                                            <SelectValue />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            <SelectItem value="json">JSON (application/json)</SelectItem>
+                                            <SelectItem value="form">
+                                                Form-encoded (application/x-www-form-urlencoded)
+                                            </SelectItem>
+                                        </SelectContent>
+                                    </Select>
+                                </div>
+                                <div className="flex items-center justify-between gap-4">
+                                    <div className="grid gap-1">
+                                        <Label htmlFor="body-template-enabled">
+                                            Tool Body Template
+                                        </Label>
+                                        <p className="text-xs text-muted-foreground">
+                                            Shape the request body with a JSON template.
+                                        </p>
+                                    </div>
+                                    <Switch
+                                        id="body-template-enabled"
+                                        checked={bodyTemplateEnabled}
+                                        onCheckedChange={onBodyTemplateEnabledChange}
+                                    />
+                                </div>
+                                {bodyTemplateEnabled && (
+                                    <BodyTemplateEditor
+                                        value={bodyTemplate}
+                                        onChange={onBodyTemplateChange}
+                                        onValidityChange={onBodyTemplateValidityChange}
+                                    />
+                                )}
+                            </div>
+                        )}
 
                         <div className="grid gap-2 pt-4 border-t">
                             <Label>Custom Headers</Label>

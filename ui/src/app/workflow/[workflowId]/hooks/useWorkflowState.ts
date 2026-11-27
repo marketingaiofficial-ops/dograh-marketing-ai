@@ -20,8 +20,10 @@ import {
     validateWorkflowApiV1WorkflowWorkflowIdValidatePost
 } from "@/client";
 import {
+    CallDispositionOption,
     NodeSpec,
     TextChatInactivityTimeoutConstraints,
+    WidgetTexts,
     WorkflowError,
 } from "@/client/types.gen";
 import { useNodeSpecs } from "@/components/flow/renderer";
@@ -94,9 +96,23 @@ function specAllowInterrupt(
     return prop?.default as boolean | undefined;
 }
 
+/** The version a save landed in, from the update response. */
+export type SavedVersion = { versionNumber?: number; versionStatus?: string };
+
 interface UseWorkflowStateProps {
+    editingDisabled?: boolean;
+    /**
+     * Called after a settings, variables or dictionary save with the version
+     * it landed in: saving a published workflow turns it into a draft.
+     */
+    onVersionSaved?: (version: SavedVersion) => void;
     initialWorkflowName: string;
     workflowId: number;
+    /**
+     * How the agent was first created (builder | template | blank | unknown),
+     * for analytics attribution on manual node edits. Immutable.
+     */
+    createdVia?: string | null;
     initialFlow?: {
         nodes: FlowNode[];
         edges: FlowEdge[];
@@ -117,14 +133,26 @@ export const useWorkflowState = ({
     initialFlow,
     initialTemplateContextVariables,
     initialWorkflowConfigurations,
+    createdVia,
     user,
+    onVersionSaved,
+    editingDisabled = false,
 }: UseWorkflowStateProps) => {
+    const reportVersion = useCallback((data: { version_number?: number | null; version_status?: string | null } | undefined) => {
+        if (!data || !onVersionSaved) return;
+        onVersionSaved({ versionNumber: data.version_number ?? undefined, versionStatus: data.version_status ?? undefined });
+    }, [onVersionSaved]);
     const router = useRouter();
     const rfInstance = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null);
     const [workflowConfigurationDefaults, setWorkflowConfigurationDefaults] =
         useState<WorkflowConfigurationDefaults | null>(null);
+    const [defaultCallDispositions, setDefaultCallDispositions] =
+        useState<CallDispositionOption[]>([]);
+    const [defaultAnswerClassifierPrompt, setDefaultAnswerClassifierPrompt] =
+        useState<string>("");
     const [textChatInactivityTimeoutConstraints, setTextChatInactivityTimeoutConstraints] =
         useState<TextChatInactivityTimeoutConstraints | null>(null);
+    const [widgetTextDefaults, setWidgetTextDefaults] = useState<WidgetTexts | null>(null);
     const [workflowConfigurationDefaultsLoaded, setWorkflowConfigurationDefaultsLoaded] =
         useState(false);
 
@@ -158,7 +186,14 @@ export const useWorkflowState = ({
         markNodeAsInvalid,
         markEdgeAsInvalid,
         setRfInstance,
+        setCreatedVia,
     } = useWorkflowStore();
+
+    // Publish the immutable creation origin into the store so node-level
+    // handlers can stamp workflow_origin on manual edit/delete analytics.
+    useEffect(() => {
+        setCreatedVia(createdVia ?? null);
+    }, [createdVia, setCreatedVia]);
 
     // Get undo/redo functions from the store
     const undo = useWorkflowStore((state) => state.undo);
@@ -179,18 +214,30 @@ export const useWorkflowState = ({
                         `Failed to load workflow configuration defaults: ${JSON.stringify(response.error)}`,
                     );
                     setWorkflowConfigurationDefaults(null);
+                    setDefaultCallDispositions([]);
+                    setDefaultAnswerClassifierPrompt("");
                     setTextChatInactivityTimeoutConstraints(null);
+                    setWidgetTextDefaults(null);
                 } else {
                     setWorkflowConfigurationDefaults(response.data.workflow_configurations);
+                    setDefaultCallDispositions(
+                        response.data.default_call_dispositions ?? [],
+                    );
+                    setDefaultAnswerClassifierPrompt(
+                        response.data.default_answer_classifier_prompt ?? "",
+                    );
                     setTextChatInactivityTimeoutConstraints(
                         response.data.text_chat_inactivity_timeout_constraints,
                     );
+                    setWidgetTextDefaults(response.data.widget_text_defaults);
                 }
             } catch (error) {
                 if (cancelled) return;
                 logger.error(`Failed to load workflow configuration defaults: ${error}`);
                 setWorkflowConfigurationDefaults(null);
+                setDefaultCallDispositions([]);
                 setTextChatInactivityTimeoutConstraints(null);
+                setWidgetTextDefaults(null);
             } finally {
                 if (!cancelled) {
                     setWorkflowConfigurationDefaultsLoaded(true);
@@ -251,6 +298,7 @@ export const useWorkflowState = ({
     // Set up keyboard shortcuts for undo/redo
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
+            if (editingDisabled) return;
             // Check if we're in an input field
             const target = e.target as HTMLElement;
             if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
@@ -278,7 +326,7 @@ export const useWorkflowState = ({
 
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [undo, redo, canUndo, canRedo]);
+    }, [undo, redo, canUndo, canRedo, editingDisabled]);
 
     const handleNodeSelect = useCallback((nodeType: string) => {
         if (!rfInstance.current) return;
@@ -308,9 +356,11 @@ export const useWorkflowState = ({
         posthog.capture(PostHogEvent.WORKFLOW_NODE_ADDED, {
             node_type: nodeType,
             workflow_id: workflowId,
+            workflow_origin: createdVia ?? "unknown",
+            source: "manual",
         });
         setIsAddNodePanelOpen(false);
-    }, [nodes, setIsAddNodePanelOpen, workflowId, bySpecName]);
+    }, [nodes, setIsAddNodePanelOpen, bySpecName, createdVia, workflowId]);
 
     const handleNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         setWorkflowName(e.target.value);
@@ -361,8 +411,8 @@ export const useWorkflowState = ({
     }, [workflowId, user, applyWorkflowErrors]);
 
     // Save workflow function. Returns version info from the API response.
-    const saveWorkflow = useCallback(async (updateWorkflowDefinition: boolean = true): Promise<{ versionNumber?: number; versionStatus?: string } | undefined> => {
-        if (!user?.id || !rfInstance.current) return;
+    const saveWorkflow = useCallback(async (updateWorkflowDefinition: boolean = true): Promise<SavedVersion | undefined> => {
+        if (editingDisabled || !user?.id || !rfInstance.current) return;
         // Read nodes/edges from the Zustand store (synchronously up-to-date)
         // and viewport from the ReactFlow instance to build the flow object.
         // This avoids a race condition where rfInstance.toObject() may return
@@ -388,7 +438,7 @@ export const useWorkflowState = ({
         }
         const viewport = rfInstance.current.getViewport();
         const flow = { nodes: currentNodes, edges: currentEdges, viewport };
-        let result: { versionNumber?: number; versionStatus?: string } | undefined;
+        let result: SavedVersion | undefined;
         let saveSucceeded = false;
         try {
             const response = await updateWorkflowApiV1WorkflowWorkflowIdPut({
@@ -451,6 +501,7 @@ export const useWorkflowState = ({
         setEdges,
         user,
         validateWorkflow,
+        editingDisabled,
         applyWorkflowErrors,
         specs,
     ]);
@@ -498,12 +549,26 @@ export const useWorkflowState = ({
     const onNodesChange: OnNodesChange = useCallback(
         (changes) => {
             const currentNodes = useWorkflowStore.getState().nodes;
+            // Keyboard / canvas / multi-node deletes arrive here as 'remove'
+            // changes (the per-node trash button uses the store directly and is
+            // captured in GenericNode, so these paths don't double-count).
+            for (const change of changes) {
+                if (change.type === "remove") {
+                    const removed = currentNodes.find(node => node.id === change.id);
+                    posthog.capture(PostHogEvent.WORKFLOW_NODE_DELETED, {
+                        node_type: removed?.type ?? "unknown",
+                        workflow_id: workflowId,
+                        workflow_origin: createdVia ?? "unknown",
+                        source: "manual",
+                    });
+                }
+            }
             const newNodes = applyNodeChanges(changes, currentNodes) as FlowNode[];
             // Cast changes to FlowNode type - safe because setNodes only uses the type field
             // to determine history tracking, not the actual item data
             setNodes(newNodes, changes as NodeChange<FlowNode>[]);
         },
-        [setNodes],
+        [setNodes, createdVia, workflowId],
     );
 
     const onDelete = useCallback(() => {
@@ -545,12 +610,13 @@ export const useWorkflowState = ({
                 );
             }
             setTemplateContextVariables(variables);
+            reportVersion(response.data);
             logger.info('Template context variables saved successfully');
         } catch (error) {
             logger.error(`Error saving template context variables: ${error}`);
             throw error;
         }
-    }, [workflowId, workflowName, user, setTemplateContextVariables]);
+    }, [workflowId, workflowName, user, setTemplateContextVariables, reportVersion]);
 
     // Save workflow configurations
     const saveWorkflowConfigurations = useCallback(async (configurations: WorkflowConfigurations, newWorkflowName: string) => {
@@ -594,12 +660,13 @@ export const useWorkflowState = ({
             setWorkflowConfigurations(savedConfigurations);
             // Set name directly in the store to avoid setWorkflowName which marks isDirty: true
             useWorkflowStore.setState({ workflowName: newWorkflowName });
+            reportVersion(response.data);
             logger.info('Workflow configurations saved successfully');
         } catch (error) {
             logger.error(`Error saving workflow configurations: ${error}`);
             throw error;
         }
-    }, [workflowId, user, setWorkflowConfigurations, workflowConfigurationDefaults]);
+    }, [workflowId, user, setWorkflowConfigurations, workflowConfigurationDefaults, reportVersion]);
 
     // Save dictionary
     const saveDictionary = useCallback(async (newDictionary: string) => {
@@ -624,11 +691,12 @@ export const useWorkflowState = ({
             }
             setDictionary(newDictionary);
             setWorkflowConfigurations(updatedConfigurations);
+            reportVersion(response.data);
         } catch (error) {
             logger.error(`Error saving dictionary: ${error}`);
             throw error;
         }
-    }, [workflowId, workflowName, user, setDictionary, setWorkflowConfigurations, workflowConfigurationDefaults]);
+    }, [workflowId, workflowName, user, setDictionary, setWorkflowConfigurations, workflowConfigurationDefaults, reportVersion]);
 
     // Update rfInstance when it changes
     useEffect(() => {
@@ -652,7 +720,10 @@ export const useWorkflowState = ({
         workflowValidationErrors,
         templateContextVariables,
         workflowConfigurations,
+        defaultCallDispositions,
+        defaultAnswerClassifierPrompt,
         textChatInactivityTimeoutConstraints,
+        widgetTextDefaults,
         dictionary,
         setNodes,
         setEdges,

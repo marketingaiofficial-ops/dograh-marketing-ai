@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Table,
     Text,
@@ -20,6 +21,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base, relationship
 
 from api.constants import DEFAULT_CAMPAIGN_RETRY_CONFIG
@@ -36,6 +38,115 @@ from ..enums import (
 )
 
 Base = declarative_base()
+
+
+class CheckpointMigrationModel(Base):
+    """Compatibility ledger for the adopted LangGraph PostgreSQL schema.
+
+    Only Alembic manages this schema; the runtime never runs LangGraph setup().
+    """
+
+    __tablename__ = "checkpoint_migrations"
+    v = Column(Integer, primary_key=True, autoincrement=False)
+
+
+class CheckpointModel(Base):
+    __tablename__ = "checkpoints"
+    thread_id = Column(Text, primary_key=True)
+    checkpoint_ns = Column(Text, primary_key=True, server_default=text("''"))
+    checkpoint_id = Column(Text, primary_key=True)
+    parent_checkpoint_id = Column(Text)
+    type = Column(Text)
+    checkpoint = Column(JSONB, nullable=False)
+    checkpoint_metadata = Column(
+        "metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    __table_args__ = (Index("checkpoints_thread_id_idx", "thread_id"),)
+
+
+class CheckpointBlobModel(Base):
+    __tablename__ = "checkpoint_blobs"
+    thread_id = Column(Text, primary_key=True)
+    checkpoint_ns = Column(Text, primary_key=True, server_default=text("''"))
+    channel = Column(Text, primary_key=True)
+    version = Column(Text, primary_key=True)
+    type = Column(Text, nullable=False)
+    blob = Column(LargeBinary)
+    __table_args__ = (Index("checkpoint_blobs_thread_id_idx", "thread_id"),)
+
+
+class CheckpointWriteModel(Base):
+    __tablename__ = "checkpoint_writes"
+    thread_id = Column(Text, primary_key=True)
+    checkpoint_ns = Column(Text, primary_key=True, server_default=text("''"))
+    checkpoint_id = Column(Text, primary_key=True)
+    task_id = Column(Text, primary_key=True)
+    idx = Column(Integer, primary_key=True, autoincrement=False)
+    channel = Column(Text, nullable=False)
+    type = Column(Text)
+    blob = Column(LargeBinary, nullable=False)
+    task_path = Column(Text, nullable=False, server_default=text("''"))
+    __table_args__ = (Index("checkpoint_writes_thread_id_idx", "thread_id"),)
+
+
+class BuilderRunModel(Base):
+    """Durable request admission and execution status, independent of SSE clients."""
+
+    __tablename__ = "workflow_builder_runs"
+    id = Column(String(36), primary_key=True)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    session_id = Column(String(36), nullable=False)
+    request = Column(JSONB, nullable=False)
+    status = Column(String(20), nullable=False, server_default="queued")
+    attempts = Column(Integer, nullable=False, server_default="0")
+    cancel_requested = Column(Boolean, nullable=False, server_default=text("false"))
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    __table_args__ = (
+        Index(
+            "builder_run_session_idx",
+            "organization_id",
+            "user_id",
+            "session_id",
+            "created_at",
+        ),
+        Index(
+            "builder_run_active_idx",
+            "organization_id",
+            "user_id",
+            "session_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
+    )
+
+
+class BuilderRunEventModel(Base):
+    __tablename__ = "workflow_builder_run_events"
+    run_id = Column(
+        String(36),
+        ForeignKey("workflow_builder_runs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    seq = Column(Integer, primary_key=True, autoincrement=False)
+    payload = Column(JSONB, nullable=False)
+
+
+class ToolMutationReceiptModel(Base):
+    """A tool mutation and its receipt commit atomically for retry-safe execution."""
+
+    __tablename__ = "tool_mutation_receipts"
+    operation_id = Column(Text, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False)
+    result = Column(JSONB, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 # TODO: remove workflow_defintion after migration, remove nullable workflow_defintion_id from Workflow and Workflowrun
@@ -218,6 +329,50 @@ class OrganizationConfigurationModel(Base):
     )
 
 
+class ProviderConnectionModel(Base):
+    __tablename__ = "provider_connections"
+
+    id = Column(Integer, primary_key=True)
+    uuid = Column(
+        String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4())
+    )
+    organization_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name = Column(String(128), nullable=False)
+    provider = Column(String(64), nullable=False)
+    credentials = Column(JSON, nullable=False, default=dict)
+    connection_settings = Column(JSON, nullable=False, default=dict)
+    revision = Column(Integer, nullable=False, default=1)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class NamedModelConfigurationModel(Base):
+    __tablename__ = "model_configurations"
+
+    id = Column(Integer, primary_key=True)
+    uuid = Column(
+        String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4())
+    )
+    organization_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name = Column(String(128), nullable=False)
+    configuration = Column(JSON, nullable=False)
+    revision = Column(Integer, nullable=False, default=1)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
 class TelephonyConfigurationModel(Base):
     __tablename__ = "telephony_configurations"
 
@@ -253,6 +408,11 @@ class TelephonyConfigurationModel(Base):
         back_populates="configuration",
         cascade="all, delete-orphan",
     )
+    trunks = relationship(
+        "TelephonyTrunkModel",
+        back_populates="configuration",
+        cascade="all, delete-orphan",
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -268,6 +428,66 @@ class TelephonyConfigurationModel(Base):
     )
 
 
+class TelephonyTrunkModel(Base):
+    """One carrier path on a telephony configuration.
+
+    A configuration holds the credentials for a provider account; a trunk is a
+    single route through that account — a primary carrier, a failover, a second
+    region.
+
+    Only providers whose Dograh integration declares ``trunk_settings_cls`` get
+    rows here. That is a statement about our integration, not about the vendor:
+    Twilio, Plivo and Telnyx all sell SIP trunking and let you assign numbers to
+    a trunk in their own consoles, but Dograh drives them through their
+    call-control APIs, where the account itself is the only route. Their numbers
+    carry a null trunk.
+
+    Phone numbers point at the trunk they are authorised on because a carrier
+    rejects, or declines to attest, a caller ID it does not own. Picking the
+    caller ID and the trunk from separate pools is the failure this table
+    exists to prevent.
+
+    Trunks are reached through their configuration, so there is no
+    ``organization_id`` here to drift out of sync with the parent row.
+    """
+
+    __tablename__ = "telephony_trunks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    telephony_configuration_id = Column(
+        Integer,
+        ForeignKey("telephony_configurations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name = Column(String(64), nullable=False)
+    enabled = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    # Provider-specific payload, validated by the provider's trunk settings
+    # schema: region and sip_domain for Cloudonix, endpoint details for ARI.
+    settings = Column(JSON, nullable=False, default=dict)
+    # The provider's own identifier for this trunk, recorded when Dograh
+    # provisions it remotely. Kept out of ``settings`` because it is Dograh's
+    # bookkeeping rather than operator input, and is stripped from responses.
+    external_id = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    configuration = relationship("TelephonyConfigurationModel", back_populates="trunks")
+    phone_numbers = relationship("TelephonyPhoneNumberModel", back_populates="trunk")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "telephony_configuration_id",
+            "name",
+            name="uq_telephony_trunks_config_name",
+        ),
+        Index("ix_telephony_trunks_config", "telephony_configuration_id"),
+    )
+
+
 class TelephonyPhoneNumberModel(Base):
     __tablename__ = "telephony_phone_numbers"
 
@@ -279,6 +499,19 @@ class TelephonyPhoneNumberModel(Base):
         Integer,
         ForeignKey("telephony_configurations.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    # The carrier path this number dials out over. Null on providers with no
+    # trunk concept, and on SIP numbers whose trunk has not been chosen yet.
+    #
+    # SET NULL rather than RESTRICT: deleting a configuration cascades to both
+    # its trunks and its numbers, and a RESTRICT here could fire against rows
+    # that same cascade is about to remove. Deleting a trunk that numbers still
+    # use is refused in the route layer instead, where the message can name
+    # them.
+    telephony_trunk_id = Column(
+        Integer,
+        ForeignKey("telephony_trunks.id", ondelete="SET NULL"),
+        nullable=True,
     )
     address = Column(String(255), nullable=False)
     address_normalized = Column(String(255), nullable=False)
@@ -309,6 +542,7 @@ class TelephonyPhoneNumberModel(Base):
     configuration = relationship(
         "TelephonyConfigurationModel", back_populates="phone_numbers"
     )
+    trunk = relationship("TelephonyTrunkModel", back_populates="phone_numbers")
     inbound_workflow = relationship("WorkflowModel")
 
     __table_args__ = (
@@ -379,6 +613,14 @@ class WorkflowDefinitionModel(Base):
         Integer, nullable=True
     )  # Sequential per workflow, display only
     published_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Extensible metadata, including release notes.
+    extra_metadata = Column(
+        JSON,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'::json"),
+    )
 
     # Full behavioral snapshot (moved from WorkflowModel to enable versioning)
     workflow_configurations = Column(
@@ -458,6 +700,10 @@ class WorkflowModel(Base):
         default=WorkflowStatus.ACTIVE.value,
         server_default=text("'active'::workflow_status"),
     )
+    # How the agent was first created, for analytics attribution. Immutable
+    # once set: "builder" | "template" | "blank". NULL on pre-existing rows
+    # (read back as "unknown"/best-effort). See api/utils/workflow_origin.py.
+    created_via = Column(String(16), nullable=True)
     workflow_definition = Column(JSON, nullable=False, default=dict)
     template_context_variables = Column(JSON, nullable=False, default=dict)
     call_disposition_codes = Column(JSON, nullable=False, default=dict)
@@ -562,6 +808,8 @@ class WorkflowRunModel(Base):
     )
     usage_info = Column(JSON, nullable=False, default=dict)
     cost_info = Column(JSON, nullable=False, default=dict)
+    model_configuration_overrides = Column(JSON, nullable=True)
+    model_configuration_snapshot = Column(JSON, nullable=True)
     initial_context = Column(JSON, nullable=False, default=dict)
     gathered_context = Column(JSON, nullable=False, default=dict)
     logs = Column(JSON, nullable=False, default=dict, server_default=text("'{}'::json"))
@@ -594,6 +842,13 @@ class WorkflowRunModel(Base):
         ),
         Index("idx_workflow_runs_workflow_id", "workflow_id"),
         Index("idx_workflow_runs_campaign_id", "campaign_id"),
+        Index(
+            "idx_workflow_runs_pending_completion",
+            "id",
+            postgresql_where=text(
+                "is_completed IS TRUE AND (extra -> 'workflow_completion' ->> 'status') IN ('pending', 'running')"
+            ),
+        ),
     )
 
 
@@ -805,6 +1060,7 @@ class QueuedRunModel(Base):
         default="queued",
     )
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
     processed_at = Column(DateTime(timezone=True), nullable=True)
 
     # New retry-related fields

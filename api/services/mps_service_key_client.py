@@ -1,16 +1,27 @@
 """
 MPS Service Key HTTP Client
-This client communicates with the Model Proxy Service (MPS) for service key management.
+This client communicates with the Model Proxy Service (MPS) for service key
+management and managed model requests.
 Service keys are stored and managed entirely in MPS, not in the local database.
 """
 
-import asyncio
+import uuid
+from datetime import datetime
 from typing import List, Optional
+from urllib.parse import quote
 
 import httpx
+from fastapi import HTTPException
 from loguru import logger
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
-from api.constants import DEPLOYMENT_MODE, DOGRAH_MPS_SECRET_KEY, MPS_API_URL
+from api.constants import (
+    DEPLOYMENT_MODE,
+    DOGRAH_DEPLOYMENT_ID,
+    DOGRAH_MPS_SECRET_KEY,
+    MPS_API_URL,
+)
+from api.db import db_client
 from api.errors.failure import ErrorSource, classify_exception, log_failure
 from api.errors.mps import MPSUnavailableError
 
@@ -40,26 +51,61 @@ def _log_mps_dependency_failure(
 
 
 class MPSServiceKeyClient:
-    """HTTP client for managing service keys via MPS API."""
+    """HTTP client for service keys and managed model requests via MPS API."""
 
     def __init__(self):
         self.base_url = MPS_API_URL
         self.timeout = httpx.Timeout(10.0)
+        # organization id -> Stack team id. Provider ids never change, so the
+        # lookup is cached for the life of the process.
+        self._stack_team_ids: dict[int, str] = {}
+
+    async def _stack_team_id(self, organization_id: Optional[int]) -> Optional[str]:
+        """The organization's Stack team id, which is how MPS keys accounts.
+
+        The same team id names the organization in every dograh deployment,
+        so MPS sees one account for it wherever it reports from. OSS requests
+        do not assert a team. Hosted requests must have a valid Stack team.
+        """
+        if DEPLOYMENT_MODE == "oss":
+            return None
+        if organization_id is None:
+            raise HTTPException(status_code=400, detail="No organization selected")
+        if organization_id in self._stack_team_ids:
+            return self._stack_team_ids[organization_id]
+
+        organization = await db_client.get_organization_by_id(organization_id)
+        if organization is None:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        provider_id = getattr(organization, "provider_id", None)
+        stack_team_id: Optional[str] = None
+        if isinstance(provider_id, str):
+            try:
+                stack_team_id = str(uuid.UUID(provider_id))
+            except ValueError:
+                stack_team_id = None
+        if stack_team_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Organization is missing a valid Stack team ID",
+            )
+        self._stack_team_ids[organization_id] = stack_team_id
+        return stack_team_id
 
     def _get_headers(
         self,
-        organization_id: Optional[int] = None,
         created_by: Optional[str] = None,
+        *,
+        stack_team_id: Optional[str] = None,
     ) -> dict:
         """
         Get headers for MPS API requests.
 
-        Args:
-            organization_id: Organization ID for authenticated mode
-            created_by: User provider ID for OSS mode
-
-        Returns:
-            Dictionary of headers
+        Hosted deployments authenticate with the shared secret and name the
+        tenant by Stack team id (``X-Stack-Team-Id``). The
+        acting user travels as ``X-Created-By`` so MPS can attribute the
+        sign-up grant of a first-seen team to a person. OSS installs send
+        only ``X-Created-By``.
         """
         headers = {"Content-Type": "application/json"}
 
@@ -67,14 +113,99 @@ class MPSServiceKeyClient:
         if DEPLOYMENT_MODE != "oss":
             if DOGRAH_MPS_SECRET_KEY:
                 headers["X-Secret-Key"] = DOGRAH_MPS_SECRET_KEY
-            if organization_id:
-                headers["X-Organization-Id"] = str(organization_id)
+            if stack_team_id:
+                headers["X-Stack-Team-Id"] = stack_team_id
+            if created_by:
+                headers["X-Created-By"] = created_by
         else:
             # OSS mode
             if created_by:
                 headers["X-Created-By"] = created_by
 
         return headers
+
+    async def _tenant_headers(
+        self,
+        organization_id: Optional[int] = None,
+        created_by: Optional[str] = None,
+    ) -> dict:
+        """Use Stack team identity for hosted requests and OSS owner headers."""
+        return self._get_headers(
+            created_by=created_by,
+            stack_team_id=await self._stack_team_id(organization_id),
+        )
+
+    async def _billing_url(self, organization_id: int) -> str:
+        """Base URL of the organization's MPS billing account."""
+        stack_team_id = await self._stack_team_id(organization_id)
+        if not stack_team_id:
+            raise HTTPException(
+                status_code=400, detail="Hosted billing requires a Stack team"
+            )
+        return f"{self.base_url}/api/v1/billing/teams/{stack_team_id}"
+
+    async def claim_signup_grant(
+        self, *, organization_id: int, created_by: str
+    ) -> dict:
+        """Called after Dograh authenticates the Stack user and selected team."""
+        team_id = await self._stack_team_id(organization_id)
+        if DEPLOYMENT_MODE == "oss" or not team_id or not DOGRAH_MPS_SECRET_KEY:
+            raise ValueError("Signup grants require a hosted Stack team")
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/api/v1/billing/teams/{team_id}/signup-grant",
+                headers=self._get_headers(created_by=created_by, stack_team_id=team_id),
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def _runtime_service_key(self, organization_id: Optional[int]) -> str:
+        if organization_id is None:
+            raise HTTPException(status_code=400, detail="No organization selected")
+        service_key = await self.find_runtime_service_key(organization_id)
+        if service_key:
+            return service_key
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Connect your Dograh account on the Models page, or add a Dograh "
+                "provider with a service key, to use this feature"
+            ),
+        )
+
+    async def find_runtime_service_key(self, organization_id: int) -> str | None:
+        """The Dograh key the organization's Dograh features run on, if any."""
+        # Imported here because configuration resolution itself uses this client.
+        from api.services.configuration.ai_model_configuration import (
+            get_resolved_ai_model_configuration,
+        )
+        from api.services.managed_model_services import get_dograh_service_api_key
+
+        resolved = await get_resolved_ai_model_configuration(
+            organization_id=organization_id
+        )
+        service_key = get_dograh_service_api_key(resolved.effective)
+        if service_key:
+            return service_key
+
+        # Utility calls still use Dograh when the default models use other
+        # providers. Reuse an existing active connection without minting a key.
+        # The catalog is scoped to this organization and ordered oldest first,
+        # so the original managed connection wins when none is selected.
+        connections = await db_client.list_provider_connections(
+            organization_id, active_only=True
+        )
+        for connection in connections:
+            if connection.provider != "dograh":
+                continue
+            keys = connection.credentials.get("api_key")
+            if isinstance(keys, str) and keys.strip():
+                return keys
+            if isinstance(keys, list):
+                for key in keys:
+                    if isinstance(key, str) and key.strip():
+                        return key
+        return None
 
     async def create_service_key(
         self,
@@ -87,8 +218,8 @@ class MPSServiceKeyClient:
         """
         Create a new service key via MPS API.
 
-        For OSS mode: organization_id should be None
-        For authenticated mode: organization_id should be provided
+        Hosted requests issue account-backed keys. OSS requests retain
+        anonymous per-key trials until the replacement OSS release ships.
         """
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             request_body = {
@@ -98,14 +229,17 @@ class MPSServiceKeyClient:
                 "created_by": created_by,
             }
 
-            # Only add organization_id for non-OSS mode
-            if DEPLOYMENT_MODE != "oss" and organization_id:
-                request_body["organization_id"] = organization_id
+            # Hosted keys belong to the organization's tenant account.
+            stack_team_id = await self._stack_team_id(organization_id)
+            if stack_team_id:
+                request_body["stack_team_id"] = stack_team_id
 
             response = await client.post(
                 f"{self.base_url}/api/v1/service-keys/",
                 json=request_body,
-                headers=self._get_headers(organization_id, created_by),
+                headers=self._get_headers(
+                    created_by=created_by, stack_team_id=stack_team_id
+                ),
             )
 
             if response.status_code == 200:
@@ -133,6 +267,41 @@ class MPSServiceKeyClient:
                     response=response,
                 )
 
+    async def ensure_cloudonix_domain(
+        self,
+        *,
+        organization_id: Optional[int],
+        created_by: str,
+    ) -> dict:
+        """Create or return the Cloudonix domain for the deployment owner.
+
+        OSS allocations are scoped by ``created_by``. Hosted allocations are
+        scoped by ``organization_id`` and authenticated with the Dograh/MPS
+        control-plane secret. No model-service key participates in ownership.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.put(
+                f"{self.base_url}/api/v1/cloudonix/domains/self",
+                headers=await self._tenant_headers(organization_id, created_by),
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                required = {
+                    "provisioning_id",
+                    "domain_name",
+                    "domain_uuid",
+                    "bearer_token",
+                }
+                if not isinstance(data, dict) or not required.issubset(data):
+                    raise MPSUnavailableError("ensure_cloudonix_domain")
+                return data
+
+            raise MPSUnavailableError(
+                "ensure_cloudonix_domain",
+                status_code=response.status_code,
+            )
+
     async def get_service_keys(
         self,
         organization_id: Optional[int] = None,
@@ -143,19 +312,18 @@ class MPSServiceKeyClient:
         Get service keys from MPS.
 
         For OSS mode: Use created_by to filter keys
-        For authenticated mode: Use organization_id to filter keys
+        For authenticated mode: Resolve the organization's Stack team to filter keys
         """
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             params = {}
+            stack_team_id = await self._stack_team_id(organization_id)
 
             if DEPLOYMENT_MODE == "oss":
                 # In OSS mode, filter by created_by
                 if created_by:
                     params["created_by"] = created_by
-            else:
-                # In authenticated mode, filter by organization_id
-                if organization_id:
-                    params["organization_id"] = organization_id
+            elif stack_team_id:
+                params["stack_team_id"] = stack_team_id
 
             if include_archived:
                 params["include_archived"] = "true"
@@ -163,7 +331,9 @@ class MPSServiceKeyClient:
             response = await client.get(
                 f"{self.base_url}/api/v1/service-keys/",
                 params=params,
-                headers=self._get_headers(organization_id, created_by),
+                headers=self._get_headers(
+                    created_by=created_by, stack_team_id=stack_team_id
+                ),
             )
 
             if response.status_code == 200:
@@ -196,10 +366,13 @@ class MPSServiceKeyClient:
         created_by: Optional[str] = None,
     ) -> Optional[dict]:
         """Get a specific service key by ID."""
+        stack_team_id = await self._stack_team_id(organization_id)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.get(
                 f"{self.base_url}/api/v1/service-keys/{key_id}",
-                headers=self._get_headers(organization_id, created_by),
+                headers=self._get_headers(
+                    created_by=created_by, stack_team_id=stack_team_id
+                ),
             )
 
             if response.status_code == 200:
@@ -213,11 +386,11 @@ class MPSServiceKeyClient:
                         )
                         return None
 
-                # Validate organization for authenticated mode
-                if DEPLOYMENT_MODE != "oss" and organization_id:
-                    if key.get("organization_id") != organization_id:
+                # Validate the tenant for authenticated mode
+                if DEPLOYMENT_MODE != "oss" and stack_team_id:
+                    if key.get("stack_team_id") != stack_team_id:
                         logger.warning(
-                            f"Access denied: Org {organization_id} tried to access key for org {key.get('organization_id')}"
+                            f"Access denied: Team {stack_team_id} tried to access key of team {key.get('stack_team_id')}"
                         )
                         return None
 
@@ -245,7 +418,7 @@ class MPSServiceKeyClient:
         Archive (soft delete) a service key.
 
         For OSS mode: Validates that created_by matches the key creator
-        For authenticated mode: Validates organization_id matches
+        For authenticated mode: Validates the Stack team matches
         """
         # First, verify ownership
         key = await self.get_service_key_by_id(key_id, organization_id, created_by)
@@ -256,7 +429,7 @@ class MPSServiceKeyClient:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.delete(
                 f"{self.base_url}/api/v1/service-keys/{key_id}",
-                headers=self._get_headers(organization_id, created_by),
+                headers=await self._tenant_headers(organization_id, created_by),
             )
 
             if response.status_code in [200, 204]:
@@ -340,6 +513,17 @@ class MPSServiceKeyClient:
                     response=response,
                 )
 
+    async def create_service_key_purchase_url(self, organization_id: int) -> dict:
+        """Create deposit-only checkout for the configured key's MPS account."""
+        key = await self._runtime_service_key(organization_id)
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/api/v1/billing/checkout-sessions/self",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+            response.raise_for_status()
+            return response.json()
+
     async def create_credit_purchase_url(
         self,
         organization_id: int,
@@ -356,9 +540,9 @@ class MPSServiceKeyClient:
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
-                f"{self.base_url}/api/v1/billing/accounts/{organization_id}/checkout-sessions",
+                f"{await self._billing_url(organization_id)}/checkout-sessions",
                 json=payload,
-                headers=self._get_headers(
+                headers=await self._tenant_headers(
                     organization_id=organization_id,
                     created_by=created_by,
                 ),
@@ -377,19 +561,63 @@ class MPSServiceKeyClient:
                 response=response,
             )
 
+    async def list_payments(
+        self, organization_id: int, created_by: Optional[str] = None
+    ) -> dict:
+        """List the org's paid credit top-ups, newest first, with invoices."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.get(
+                f"{await self._billing_url(organization_id)}/payments",
+                headers=await self._tenant_headers(
+                    organization_id=organization_id,
+                    created_by=created_by,
+                ),
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def get_invoice_pdf(
+        self,
+        organization_id: int,
+        payment_order_id: int,
+        created_by: Optional[str] = None,
+    ) -> httpx.Response:
+        """Fetch a paid top-up's invoice PDF; raises httpx.HTTPStatusError."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.get(
+                f"{await self._billing_url(organization_id)}"
+                f"/invoices/{payment_order_id}/pdf",
+                headers=await self._tenant_headers(
+                    organization_id=organization_id,
+                    created_by=created_by,
+                ),
+            )
+            response.raise_for_status()
+            return response
+
     async def get_credit_ledger(
         self,
         organization_id: int,
         page: int = 1,
         limit: int = 50,
         created_by: Optional[str] = None,
+        entry_type: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
     ) -> dict:
-        """Get the MPS v2 billing account balance and recent credit ledger."""
+        """Get the MPS balance and ledger, optionally filtered before pagination."""
+        params: dict[str, str | int] = {"page": page, "limit": limit}
+        if entry_type is not None:
+            params["entry_type"] = entry_type
+        if start_date is not None:
+            params["start_date"] = start_date.isoformat()
+        if end_date is not None:
+            params["end_date"] = end_date.isoformat()
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.get(
-                f"{self.base_url}/api/v1/billing/accounts/{organization_id}/ledger",
-                params={"page": page, "limit": limit},
-                headers=self._get_headers(
+                f"{await self._billing_url(organization_id)}/ledger",
+                params=params,
+                headers=await self._tenant_headers(
                     organization_id=organization_id,
                     created_by=created_by,
                 ),
@@ -417,8 +645,8 @@ class MPSServiceKeyClient:
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.get(
-                    f"{self.base_url}/api/v1/billing/accounts/{organization_id}/pricing",
-                    headers=self._get_headers(organization_id=organization_id),
+                    f"{await self._billing_url(organization_id)}/pricing",
+                    headers=await self._tenant_headers(organization_id=organization_id),
                 )
 
                 if response.status_code == 200:
@@ -451,8 +679,8 @@ class MPSServiceKeyClient:
         """Create or return the MPS v2 billing account for an organization."""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.get(
-                f"{self.base_url}/api/v1/billing/accounts/{organization_id}/balance",
-                headers=self._get_headers(
+                f"{await self._billing_url(organization_id)}/balance",
+                headers=await self._tenant_headers(
                     organization_id=organization_id,
                     created_by=created_by,
                 ),
@@ -485,6 +713,7 @@ class MPSServiceKeyClient:
         """Authorize a hosted workflow run and optionally mint its MPS correlation."""
         payload = {
             "workflow_run_id": workflow_run_id,
+            "deployment_id": DOGRAH_DEPLOYMENT_ID,
             "service_key": service_key,
             "require_correlation_id": require_correlation_id,
             "metadata": metadata or {},
@@ -494,9 +723,9 @@ class MPSServiceKeyClient:
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
-                f"{self.base_url}/api/v1/billing/accounts/{organization_id}/run-authorization",
+                f"{await self._billing_url(organization_id)}/run-authorization",
                 json=payload,
-                headers=self._get_headers(
+                headers=await self._tenant_headers(
                     organization_id=organization_id,
                     created_by=created_by,
                 ),
@@ -527,6 +756,7 @@ class MPSServiceKeyClient:
         """Authorize an OSS run using the configured service key as identity."""
         payload = {
             "workflow_run_id": workflow_run_id,
+            "deployment_id": DOGRAH_DEPLOYMENT_ID,
             "require_correlation_id": require_correlation_id,
             "metadata": metadata or {},
         }
@@ -563,7 +793,7 @@ class MPSServiceKeyClient:
         workflow_run_id: int | None = None,
     ) -> dict:
         """Mint a server-generated correlation ID for managed model services."""
-        payload: dict[str, int] = {}
+        payload: dict[str, int | str] = {"deployment_id": DOGRAH_DEPLOYMENT_ID}
         if workflow_run_id is not None:
             payload["workflow_run_id"] = workflow_run_id
 
@@ -590,6 +820,52 @@ class MPSServiceKeyClient:
                 response=response,
             )
 
+    async def create_agent_builder_completion(
+        self,
+        *,
+        service_key: str,
+        messages: list[dict],
+        max_tokens: int,
+        metadata: dict | None = None,
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
+    ) -> dict:
+        """Request one billed Agent Builder completion.
+
+        Authenticate with the caller's configured Dograh Service Key. MPS owns
+        model selection, request identity, price snapshot and credit settlement.
+        Return the full response, preserving provider reasoning/tool metadata.
+
+        Transport and HTTP failures propagate to the caller.
+        """
+        headers = {"Authorization": f"Bearer {service_key}"}
+        metadata = {
+            key: value
+            for key, value in (metadata or {}).items()
+            if key not in {"correlation_id", "mps_billing_version"}
+        }
+        # Only W3C trace context; never forward baggage or caller credentials to
+        # another destination. MPS remains responsible for the generation span.
+        TraceContextTextMapPropagator().inject(headers)
+        # Builder-only call. The build stage can generate a full @dograh/sdk
+        # workflow, which can run longer than a chat turn; keep this under the
+        # 300s builder step deadline (service.py) so that stays the outer bound.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(290, connect=10)) as client:
+            response = await client.post(
+                f"{self.base_url.rstrip('/')}/api/v1/agent-builder/chat/completions",
+                headers=headers,
+                json={
+                    "messages": messages,
+                    "stream": False,
+                    "max_tokens": max_tokens,
+                    "tools": tools,
+                    "tool_choice": tool_choice,
+                    "metadata": metadata,
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+
     async def report_platform_usage(
         self,
         *,
@@ -598,7 +874,6 @@ class MPSServiceKeyClient:
         duration_seconds: Optional[float] = None,
         workflow_run_id: int | None = None,
         metadata: Optional[dict] = None,
-        max_attempts: int = 3,
     ) -> dict:
         """Report hosted Dograh platform usage for a completed workflow run."""
         if DEPLOYMENT_MODE == "oss":
@@ -609,6 +884,7 @@ class MPSServiceKeyClient:
             )
 
         payload: dict = {
+            "deployment_id": DOGRAH_DEPLOYMENT_ID,
             "metadata": metadata or {},
         }
         if correlation_id:
@@ -618,45 +894,21 @@ class MPSServiceKeyClient:
         if workflow_run_id is not None:
             payload["workflow_run_id"] = workflow_run_id
 
-        max_attempts = max(1, max_attempts)
-        last_response: httpx.Response | None = None
+        url = f"{await self._billing_url(organization_id)}/platform-usage"
+        headers = await self._tenant_headers(organization_id=organization_id)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for attempt in range(1, max_attempts + 1):
-                response = await client.post(
-                    (
-                        f"{self.base_url}/api/v1/billing/accounts/"
-                        f"{organization_id}/platform-usage"
-                    ),
-                    json=payload,
-                    headers=self._get_headers(organization_id=organization_id),
-                )
-                last_response = response
+            response = await client.post(url, json=payload, headers=headers)
 
-                if response.status_code == 200:
-                    return response.json()
+        if response.status_code == 200:
+            return response.json()
 
-                usage_not_ready = (
-                    response.status_code == 409 and "usage_not_ready" in response.text
-                )
-                if usage_not_ready and attempt < max_attempts:
-                    await asyncio.sleep(attempt)
-                    continue
-
-                log = logger.warning if usage_not_ready else logger.error
-                log(
-                    "Failed to report platform usage: "
-                    f"{response.status_code} - {response.text}"
-                )
-                raise httpx.HTTPStatusError(
-                    f"Failed to report platform usage: {response.text}",
-                    request=response.request,
-                    response=response,
-                )
-
+        logger.error(
+            f"Failed to report platform usage: {response.status_code} - {response.text}"
+        )
         raise httpx.HTTPStatusError(
-            "Failed to report platform usage",
-            request=last_response.request,
-            response=last_response,
+            f"Failed to report platform usage: {response.text}",
+            request=response.request,
+            response=response,
         )
 
     async def transcribe_audio(
@@ -701,7 +953,13 @@ class MPSServiceKeyClient:
             if correlation_id:
                 data["correlation_id"] = correlation_id
 
-            headers = self._get_headers(organization_id, created_by)
+            service_key = await self._runtime_service_key(organization_id)
+            if not correlation_id:
+                correlation = await self.create_correlation_id(service_key=service_key)
+                correlation_id = correlation["correlation_id"]
+            data["correlation_id"] = correlation_id
+            data["mps_billing_version"] = "2"
+            headers = {"Authorization": f"Bearer {service_key}"}
             # Remove Content-Type so httpx sets the correct multipart boundary
             headers.pop("Content-Type", None)
 
@@ -813,7 +1071,7 @@ class MPSServiceKeyClient:
                     params["accent"] = accent
                 response = await client.get(
                     f"{self.base_url}/api/v1/voice-proxy/{provider}/voices",
-                    headers=self._get_headers(organization_id, created_by),
+                    headers=await self._tenant_headers(organization_id, created_by),
                     params=params,
                 )
 
@@ -879,7 +1137,8 @@ class MPSServiceKeyClient:
         if correlation_id:
             data["correlation_id"] = correlation_id
 
-        headers = self._get_headers(organization_id, created_by)
+        service_key = await self._runtime_service_key(organization_id)
+        headers = {"Authorization": f"Bearer {service_key}"}
         # Remove JSON content-type so httpx sets the correct multipart boundary.
         headers.pop("Content-Type", None)
 
@@ -915,10 +1174,10 @@ class MPSServiceKeyClient:
         created_by: Optional[str] = None,
     ) -> dict:
         """
-        Call the MPS workflow creation API using secret key authentication.
+        Call the MPS workflow creation API using the configured service key.
 
-        For OSS mode: Pass created_by in headers
-        For authenticated mode: Pass organization_id in headers
+        Uses the selected Dograh provider or an active saved Dograh connection.
+        OSS users without an organization retain legacy owner-based access.
 
         Args:
             call_type: INBOUND or OUTBOUND
@@ -933,6 +1192,11 @@ class MPSServiceKeyClient:
         Raises:
             HTTPException: If the API call fails
         """
+        if DEPLOYMENT_MODE == "oss" and organization_id is None and created_by:
+            headers = self._get_headers(created_by=created_by)
+        else:
+            service_key = await self._runtime_service_key(organization_id)
+            headers = {"Authorization": f"Bearer {service_key}"}
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
             response = await client.post(
                 f"{self.base_url}/api/v1/workflow/create-workflow",
@@ -941,7 +1205,7 @@ class MPSServiceKeyClient:
                     "use_case": use_case,
                     "activity_description": activity_description,
                 },
-                headers=self._get_headers(organization_id, created_by),
+                headers=headers,
             )
 
             if response.status_code == 200:
@@ -955,6 +1219,135 @@ class MPSServiceKeyClient:
                     request=response.request,
                     response=response,
                 )
+
+    # Connect Dograh account: a self-hosted install starts a request and polls
+    # for its key; the hosted app looks the request up and approves it for the
+    # signed-in person's team.
+
+    _CONNECT_PATH = "/api/v1/service-keys/connect"
+    # MPS writes these details for people (expired code, already approved,
+    # too many requests), so they pass through to the UI unchanged.
+    _CONNECT_PASSTHROUGH_STATUSES = frozenset({400, 403, 404, 409, 410, 429})
+
+    async def _connect_call(
+        self,
+        operation: str,
+        method: str,
+        path: str,
+        *,
+        headers: dict,
+        json: dict | None = None,
+        organization_id: int | None = None,
+    ) -> dict:
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.request(
+                    method,
+                    f"{self.base_url}{self._CONNECT_PATH}{path}",
+                    headers=headers,
+                    json=json,
+                )
+        except httpx.RequestError as exc:
+            _log_mps_dependency_failure(
+                exc, operation=operation, organization_id=organization_id
+            )
+            raise MPSUnavailableError(operation) from exc
+        if response.status_code == 200:
+            return response.json()
+        if response.status_code in self._CONNECT_PASSTHROUGH_STATUSES:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            detail = body.get("detail") if isinstance(body, dict) else None
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=detail if isinstance(detail, str) else "Request failed",
+            )
+        error = MPSUnavailableError(operation, status_code=response.status_code)
+        _log_mps_dependency_failure(
+            error, operation=operation, organization_id=organization_id
+        )
+        raise error
+
+    async def start_account_connect(
+        self, *, install_name: str, install_url: str | None, created_by: str
+    ) -> dict:
+        """Start connecting this self-hosted install to a Dograh account."""
+        return await self._connect_call(
+            "start_account_connect",
+            "POST",
+            "/start",
+            headers={"Content-Type": "application/json"},
+            json={
+                "install_name": install_name,
+                "install_url": install_url,
+                "created_by": created_by,
+            },
+        )
+
+    async def poll_account_connect(self, device_code: str) -> dict:
+        """Collect the approved key; delivery is retryable until acknowledged."""
+        return await self._connect_call(
+            "poll_account_connect",
+            "POST",
+            "/poll",
+            headers={"Content-Type": "application/json"},
+            json={"device_code": device_code},
+        )
+
+    async def email_account_connect(self, step: str, payload: dict) -> dict:
+        if step not in {"start", "verify", "confirm"}:
+            raise ValueError("Unknown email connection step")
+        return await self._connect_call(
+            f"email_connect_{step}",
+            "POST",
+            f"/email/{step}",
+            headers={"Content-Type": "application/json"},
+            json=payload,
+        )
+
+    async def acknowledge_account_connect(self, device_code: str) -> dict:
+        """Confirm durable local storage so MPS can forget the delivery copy."""
+        return await self._connect_call(
+            "acknowledge_account_connect",
+            "POST",
+            "/acknowledge",
+            headers={"Content-Type": "application/json"},
+            json={"device_code": device_code},
+        )
+
+    async def get_account_connect_request(
+        self, user_code: str, *, organization_id: int, created_by: str
+    ) -> dict:
+        """Describe a pending request so the person can recognise the install."""
+        return await self._connect_call(
+            "get_account_connect_request",
+            "GET",
+            f"/requests/{quote(user_code, safe='')}",
+            headers=await self._tenant_headers(organization_id, created_by),
+            organization_id=organization_id,
+        )
+
+    async def decide_account_connect_request(
+        self,
+        user_code: str,
+        *,
+        approve: bool,
+        organization_id: int,
+        created_by: str,
+        team_name: str | None = None,
+    ) -> dict:
+        """Approve the request for the organization's team, or deny it."""
+        decision = "approve" if approve else "deny"
+        return await self._connect_call(
+            f"{decision}_account_connect_request",
+            "POST",
+            f"/requests/{quote(user_code, safe='')}/{decision}",
+            headers=await self._tenant_headers(organization_id, created_by),
+            json=({"team_name": team_name} if approve else None),
+            organization_id=organization_id,
+        )
 
 
 # Create a singleton instance

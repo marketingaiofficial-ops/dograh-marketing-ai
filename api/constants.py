@@ -9,14 +9,24 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", Environment.LOCAL.value)
 # when constructing file-system paths elsewhere in the codebase.
 APP_ROOT_DIR: Path = Path(__file__).resolve().parent
 
-FILLER_SOUND_PROBABILITY = 0.0
-
 VOICEMAIL_RECORDING_DURATION = 5.0
 
 # Langfuse Configuration
 LANGFUSE_HOST = os.getenv("LANGFUSE_HOST")
 LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY")
 LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY")
+LANGFUSE_PROJECT_ID = os.getenv("LANGFUSE_PROJECT_ID")
+
+# Tracing as a whole is optional, but a half-configured Langfuse silently
+# produces dead trace links, so fail loudly at import instead.
+if all([LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY]) and not (
+    LANGFUSE_PROJECT_ID
+):
+    raise RuntimeError(
+        "LANGFUSE_PROJECT_ID is required when LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY "
+        "and LANGFUSE_SECRET_KEY are set. Find it in your Langfuse project URL "
+        "(/project/<project_id>/...) or via GET <host>/api/public/projects."
+    )
 
 # URLs for deployment
 #
@@ -27,6 +37,16 @@ LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY")
 # var can still be set explicitly to override it for a split deployment.
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL") or None
 PUBLIC_HOST = os.getenv("PUBLIC_HOST") or None
+
+# The server's own IPv4 address, as the operator supplied it to the setup
+# script. Usually identical to PUBLIC_HOST, but kept distinct because it must
+# stay a raw IP (coturn's external-ip needs one) while PUBLIC_HOST may be a
+# hostname such as an sslip.io name. resolve_ice_filter_policies() classifies
+# it to detect a private-LAN or CGNAT deployment (e.g. Tailscale, no public
+# IP) and pick ICE candidate filtering accordingly, so an empty value here is
+# read as "public deployment" — every consumer of this must be wired through
+# docker-compose, or that detection silently misfires.
+SERVER_IP = os.getenv("SERVER_IP", "")
 
 # Public URL the backend builds webhook/callback/embed links from. Derives from
 # PUBLIC_BASE_URL (public IP / domain), falling back to localhost for local dev.
@@ -40,6 +60,12 @@ UI_APP_URL = os.getenv("UI_APP_URL", "http://localhost:3010")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
+
+
+def is_prompt_cache_disabled() -> bool:
+    """Global kill switch, checked before cache creation or attachment."""
+    return os.getenv("DOGRAH_PROMPT_CACHE_DISABLED", "").lower() in {"1", "true"}
+
 
 DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "oss")
 CORS_ALLOWED_ORIGINS = [
@@ -55,7 +81,13 @@ STACK_AUTH_PROJECT_ID = os.getenv("STACK_AUTH_PROJECT_ID")
 STACK_PUBLISHABLE_CLIENT_KEY = os.getenv("STACK_PUBLISHABLE_CLIENT_KEY")
 DOGRAH_MPS_SECRET_KEY = os.getenv("DOGRAH_MPS_SECRET_KEY", None)
 MPS_API_URL = os.getenv("MPS_API_URL", "https://services.dograh.com")
+DOGRAH_DEPLOYMENT_ID = os.getenv(
+    "DOGRAH_DEPLOYMENT_ID", "oss" if DEPLOYMENT_MODE == "oss" else "us"
+)
 DOGRAH_DEVOPS_SECRET = os.getenv("DOGRAH_DEVOPS_SECRET") or None
+ENABLE_PROMETHEUS_METRICS = (
+    os.getenv("ENABLE_PROMETHEUS_METRICS", "false").lower() == "true"
+)
 
 # Storage Configuration
 ENABLE_AWS_S3 = os.getenv("ENABLE_AWS_S3", "false").lower() == "true"
@@ -98,6 +130,16 @@ POSTHOG_HOST = os.getenv("POSTHOG_HOST", "https://us.i.posthog.com")
 
 ENABLE_ARI_STASIS = os.getenv("ENABLE_ARI_STASIS", "false").lower() == "true"
 SERIALIZE_LOG_OUTPUT = os.getenv("SERIALIZE_LOG_OUTPUT", "false").lower() == "true"
+
+# Whether the end-of-call audio recordings (mixed / user / bot tracks) are
+# uploaded to object storage. Deployments that must not retain call audio, or
+# that simply do not want to pay for the storage, can turn this off. The
+# transcript upload and every other artifact are unaffected. Audio is still
+# buffered in memory during the call (integrations such as Noveum consume it);
+# only the upload and the recording_url / recordings metadata are skipped.
+ENABLE_CALL_RECORDING_UPLOAD = (
+    os.getenv("ENABLE_CALL_RECORDING_UPLOAD", "true").lower() == "true"
+)
 
 # Telephony media WebSocket authentication.
 # The carrier/connector dials back the media socket
@@ -172,6 +214,9 @@ COUNTRY_CODES = {
 DEFAULT_ORG_CONCURRENCY_LIMIT = max(
     1, int(os.getenv("DEFAULT_ORG_CONCURRENCY_LIMIT", "10"))
 )
+# Outlast both the dispatcher's 240-second timeout and ARQ's 300-second deadline.
+CAMPAIGN_PROCESSING_CLAIM_TIMEOUT_SECONDS = 360
+
 DEFAULT_CAMPAIGN_RETRY_CONFIG = {
     "enabled": True,
     "max_retries": 1,

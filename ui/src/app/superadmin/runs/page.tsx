@@ -3,10 +3,11 @@
 import { AlertTriangle, ArrowDown, ArrowUp, ArrowUpDown, CheckCircle, ChevronLeft, ChevronRight, ExternalLink, FileText, Info, Loader2, RefreshCw } from 'lucide-react';
 import Image from 'next/image';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { getWorkflowRunsApiV1SuperuserWorkflowRunsGet } from '@/client/sdk.gen';
 import { FilterBuilder } from "@/components/filters/FilterBuilder";
+import { PageShell } from '@/components/layout/PageShell';
 import { MediaPreviewButton, MediaPreviewDialog } from '@/components/MediaPreviewDialog';
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -20,9 +21,10 @@ import {
     TableRow,
 } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useDispositionCodes } from '@/hooks/useDispositionCodes';
 import { useAuth } from '@/lib/auth';
 import { formatDateTime } from '@/lib/dateTime';
-import{ superadminFilterAttributes } from "@/lib/filterAttributes";
+import { superadminFilterAttributes, withDispositionCodeOptions } from "@/lib/filterAttributes";
 import { decodeFiltersFromURL, encodeFiltersToURL } from '@/lib/filters';
 import { impersonateAsSuperadmin } from '@/lib/utils';
 import { ActiveFilter } from '@/types/filters';
@@ -94,6 +96,11 @@ export default function RunsPage() {
     const [selectedRowId, setSelectedRowId] = useState<number | null>(null);
 
     const auth = useAuth();
+    const { endTaskReasonCodes } = useDispositionCodes();
+    const availableSuperadminFilterAttributes = useMemo(
+        () => withDispositionCodeOptions(superadminFilterAttributes, endTaskReasonCodes),
+        [endTaskReasonCodes]
+    );
 
     // Media preview dialog
     const mediaPreview = MediaPreviewDialog();
@@ -282,17 +289,17 @@ export default function RunsPage() {
 
     if (isLoading && runs.length === 0) {
         return (
-            <div className="container mx-auto p-6 flex items-center justify-center min-h-[400px]">
+            <PageShell width="full" className="flex min-h-[400px] items-center justify-center">
                 <div className="flex items-center space-x-2">
                     <Loader2 className="h-6 w-6 animate-spin" />
                     <span>Loading workflow runs...</span>
                 </div>
-            </div>
+            </PageShell>
         );
     }
 
     return (
-        <div className="container mx-auto p-6 space-y-6 max-w-full">
+        <PageShell width="full" className="space-y-6">
             <div>
                 <h1 className="text-3xl font-bold mb-2">Workflow Runs</h1>
                 <p className="text-muted-foreground">View and manage all workflow runs across organizations</p>
@@ -305,7 +312,7 @@ export default function RunsPage() {
                 )}
 
                 <FilterBuilder
-                    availableAttributes={superadminFilterAttributes}
+                    availableAttributes={availableSuperadminFilterAttributes}
                     activeFilters={activeFilters}
                     onFiltersChange={handleFiltersChange}
                     onApplyFilters={handleApplyFilters}
@@ -439,6 +446,19 @@ export default function RunsPage() {
                                                     </TableCell>
                                                     <TableCell className="text-sm">
                                                         <div className="flex items-center space-x-1">
+                                                            {run.initial_context && (
+                                                                <Tooltip>
+                                                                    <TooltipTrigger asChild>
+                                                                        <Info className="h-4 w-4 text-green-600 cursor-pointer" />
+                                                                    </TooltipTrigger>
+                                                                    <TooltipContent sideOffset={4} className="max-w-sm whitespace-pre-wrap break-words">
+                                                                        <p className="font-semibold text-xs mb-1">Initial Context</p>
+                                                                        <pre className="max-w-sm whitespace-pre-wrap break-words text-xs">
+                                                                            {JSON.stringify(run.initial_context, null, 2)}
+                                                                        </pre>
+                                                                    </TooltipContent>
+                                                                </Tooltip>
+                                                            )}
                                                             {run.gathered_context && (
                                                                 <Tooltip>
                                                                     <TooltipTrigger asChild>
@@ -465,7 +485,7 @@ export default function RunsPage() {
                                                                     </TooltipContent>
                                                                 </Tooltip>
                                                             )}
-                                                            {!run.gathered_context && !run.usage_info && (
+                                                            {!run.initial_context && !run.gathered_context && !run.usage_info && (
                                                                 <span className="text-muted-foreground">-</span>
                                                             )}
                                                         </div>
@@ -643,6 +663,6 @@ export default function RunsPage() {
                 {/* Media Preview Dialog */}
                 {mediaPreview.dialog}
 
-        </div>
+        </PageShell>
     );
 }

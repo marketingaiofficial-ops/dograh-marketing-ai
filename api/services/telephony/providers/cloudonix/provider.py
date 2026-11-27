@@ -4,6 +4,7 @@ Cloudonix implementation of the TelephonyProvider interface.
 
 import asyncio
 import json
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -19,11 +20,18 @@ from api.services.telephony.base import (
     NormalizedInboundData,
     ProviderPhoneNumberLookupError,
     ProviderSyncResult,
+    SIPConnectivityDetails,
+    SIPRegionDetails,
+    SIPTransportDetails,
     TelephonyProvider,
 )
+from api.services.telephony.sip import first_sip_string, normalize_sip_headers
 from api.services.workflow.initial_context import merge_external_initial_context
 from api.utils.common import get_backend_endpoints
 from api.utils.telephony_address import normalize_telephony_address
+
+from .config import normalize_cloudonix_domain
+from .regions import CLOUDONIX_REGIONS, CloudonixRegion
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -34,6 +42,39 @@ CLOUDONIX_API_BASE_URL = "https://api.cloudonix.io"
 # stream opens. The agent-stream route holds an org concurrency slot while we
 # wait, so an idle socket must not be able to hold it indefinitely.
 AGENT_STREAM_HANDSHAKE_TIMEOUT_S = 10
+
+
+def _key_tail(key: str | None) -> str:
+    """Last 8 characters of an API key, for logs that compare two keys."""
+    if not key:
+        return "MISSING"
+    return key[-8:] if len(key) > 8 else "SHORT_KEY"
+
+
+def _inbound_transports(
+    hostname: str, region: CloudonixRegion
+) -> list[SIPTransportDetails]:
+    """The three SIP transports Cloudonix accepts on a region's edge."""
+    return [
+        SIPTransportDetails(
+            transport="UDP",
+            hostname=hostname,
+            port=region.sip_port,
+            uri=f"{hostname}:{region.sip_port}",
+        ),
+        SIPTransportDetails(
+            transport="TCP",
+            hostname=hostname,
+            port=region.sip_port,
+            uri=f"{hostname}:{region.sip_port};transport=tcp;",
+        ),
+        SIPTransportDetails(
+            transport="TLS",
+            hostname=hostname,
+            port=region.tls_port,
+            uri=f"{hostname}:{region.tls_port};transport=tls;",
+        ),
+    ]
 
 
 class CloudonixProvider(TelephonyProvider):
@@ -52,14 +93,22 @@ class CloudonixProvider(TelephonyProvider):
         Args:
             config: Dictionary containing:
                 - bearer_token: Cloudonix API Bearer Token
-                - domain_id: Cloudonix Domain ID
+                - domain_id: Configured Cloudonix domain name
+                - domain_uuid: UUID returned by Cloudonix's domainGet API
                 - application_name: Cloudonix Voice Application name whose
                     url is updated by ``configure_inbound``
+                - trunks: Dograh-managed outbound voice trunks on this domain
+                - trunk_id_by_number: which trunk each active number dials out
+                    on, so a call is pinned to the carrier that authorised its
+                    caller ID
                 - from_numbers: List of phone numbers to use (optional, fetched from API if not provided)
         """
         self.bearer_token = config.get("bearer_token")
         self.domain_id = self._normalize_domain(config.get("domain_id"))
+        self.domain_uuid = config.get("domain_uuid")
         self.application_name = config.get("application_name")
+        self.trunks = config.get("trunks") or []
+        self.trunk_id_by_number = config.get("trunk_id_by_number") or {}
         self.from_numbers = config.get("from_numbers", [])
         self.default_from_number = config.get("default_from_number")
 
@@ -69,23 +118,26 @@ class CloudonixProvider(TelephonyProvider):
 
         self.base_url = CLOUDONIX_API_BASE_URL
 
+    def _pin_trunk(self, data: Dict[str, Any], from_number: Optional[str]) -> None:
+        """Route the call over the trunk that authorised its caller ID.
+
+        Cloudonix otherwise tries every active trunk in creation order, which
+        can present a number one carrier owns to a different carrier. When no
+        trunk resolves we leave the selector off rather than guess — and we
+        drop any the caller passed through kwargs, since the stored assignment
+        is what decides this.
+        """
+        trunk = self.select_trunk(from_number)
+        name = trunk.get("name") if trunk else None
+        if isinstance(name, str) and name.strip():
+            data["trunk"] = name.strip()
+        else:
+            data.pop("trunk", None)
+
     @staticmethod
     def _normalize_domain(domain: Optional[str]) -> Optional[str]:
-        """Ensure a Cloudonix domain is fully qualified.
-
-        Cloudonix domains are always of the form ``<name>.cloudonix.net``.
-        Users sometimes configure or pass just ``<name>``; normalize so
-        equality checks against stored credentials and API URLs work
-        regardless of input form.
-        """
-        if not domain:
-            return domain
-        domain = domain.strip()
-        if not domain:
-            return domain
-        if domain.endswith(".cloudonix.net"):
-            return domain
-        return f"{domain}.cloudonix.net"
+        """Normalize short names without rewriting custom Cloudonix FQDNs."""
+        return normalize_cloudonix_domain(domain)
 
     def _get_auth_headers(self) -> Dict[str, str]:
         """Generate authorization headers for Cloudonix API."""
@@ -93,6 +145,29 @@ class CloudonixProvider(TelephonyProvider):
             "Authorization": f"Bearer {self.bearer_token}",
             "Content-Type": "application/json",
         }
+
+    def get_sip_connectivity_details(self) -> SIPConnectivityDetails | None:
+        """Return Cloudonix's regional SIP connection details."""
+        if not isinstance(self.domain_uuid, str):
+            return None
+
+        domain_uuid = self.domain_uuid.strip()
+        if not domain_uuid:
+            return None
+
+        return SIPConnectivityDetails(
+            provider_display_name="Cloudonix",
+            regions=[
+                SIPRegionDetails(
+                    region=region.name,
+                    inbound_transports=_inbound_transports(
+                        region.hostname(domain_uuid), region
+                    ),
+                    outbound_origin_ip=region.edge_ip,
+                )
+                for region in CLOUDONIX_REGIONS
+            ],
+        )
 
     async def initiate_call(
         self,
@@ -146,7 +221,6 @@ class CloudonixProvider(TelephonyProvider):
 </Response>""",
             "caller-id": from_number,  # Required field
         }
-
         # TODO: Cloudonix status callbacks are spammy, so commenting it out. Can send it to
         # some persistent logging system instead of transcational database.
         # Add status callback if workflow_run_id provided
@@ -156,6 +230,7 @@ class CloudonixProvider(TelephonyProvider):
 
         # Merge any additional kwargs
         data.update(kwargs)
+        self._pin_trunk(data, from_number)
 
         # Make the API request
         headers = self._get_auth_headers()
@@ -793,23 +868,53 @@ class CloudonixProvider(TelephonyProvider):
         - SessionData: Contains additional call info including underlying provider details
         """
 
-        session_data = webhook_data.get("SessionData", {})
-        token = session_data.get("token", "") if isinstance(session_data, dict) else ""
+        session_data = webhook_data.get("SessionData")
+        session_data = session_data if isinstance(session_data, dict) else {}
+        profile = session_data.get("profile")
+        profile = profile if isinstance(profile, dict) else {}
+        token = session_data.get("token", "")
 
         call_id = webhook_data.get("Session") or webhook_data.get("CallSid") or token
 
-        account_id = CloudonixProvider._normalize_domain(
-            webhook_data.get("Domain") or webhook_data.get("AccountSid", "")
+        raw_domain = webhook_data.get("Domain")
+        raw_account_sid = webhook_data.get("AccountSid", "")
+        account_id = CloudonixProvider._normalize_domain(raw_domain or raw_account_sid)
+        # The domain is what picks the telephony configuration — and therefore
+        # the organization — for this call, so record both fields it can come
+        # from before they are collapsed into one normalized value.
+        logger.info(
+            f"Cloudonix inbound webhook domain fields — Domain={raw_domain!r} "
+            f"AccountSid={raw_account_sid!r} normalized={account_id!r} "
+            f"To={webhook_data.get('To')!r} From={webhook_data.get('From')!r}"
         )
 
         # Extract underlying provider information from SessionData if available
-        session_data = webhook_data.get("SessionData", {})
         underlying_provider = None
-        if isinstance(session_data, dict):
-            profile = session_data.get("profile", {})
-            trunk_headers = profile.get("trunk-sip-headers", {})
-            if "Twilio-AccountSid" in trunk_headers:
-                underlying_provider = "twilio"
+        trunk_headers = profile.get("trunk-sip-headers")
+        if isinstance(trunk_headers, dict) and "Twilio-AccountSid" in trunk_headers:
+            underlying_provider = "twilio"
+
+        # Cloudonix's CallSid/Session identify its session, not the caller's
+        # SIP dialog. The latter is repeated in callIds, profile.callId and CID.
+        sip_headers = normalize_sip_headers(
+            (name, value)
+            for field in ("trunk-sip-headers", "subscriber-sip-headers")
+            if isinstance(forwarded := profile.get(field), dict)
+            for name, value in forwarded.items()
+        )
+        lowered = {name.lower(): value for name, value in sip_headers.items()}
+        sip_call_id = (
+            first_sip_string(session_data.get("callIds"))
+            or first_sip_string(profile.get("callId"))
+            or next(
+                (
+                    lowered[name]
+                    for name in ("cid", "call-id", "correlation-id", "x-correlation-id")
+                    if lowered.get(name)
+                ),
+                None,
+            )
+        )
 
         direction = webhook_data.get("Direction", "inbound").lower()
         if direction in {"inbound", "subscriber"}:
@@ -829,6 +934,8 @@ class CloudonixProvider(TelephonyProvider):
                 **webhook_data,
                 "underlying_provider": underlying_provider,
             },
+            sip_call_id=sip_call_id,
+            sip_headers=sip_headers,
         )
 
     @staticmethod
@@ -880,10 +987,21 @@ class CloudonixProvider(TelephonyProvider):
         is_valid = api_key == self.bearer_token
 
         if is_valid:
-            logger.info("Cloudonix x-cx-apikey validation successful")
+            logger.info(
+                f"Cloudonix x-cx-apikey validation successful for "
+                f"domain={self.domain_id}"
+            )
         else:
+            # A mismatch here usually means the config this request resolved to
+            # is not the one Cloudonix called: the key belongs to whichever
+            # domain took the call, the expected key to whatever the inbound
+            # route matched. Print both tails so the two can be told apart.
             logger.warning(
-                f"Cloudonix x-cx-apikey validation failed. Expected key ending with ...{self.bearer_token[-8:] if len(self.bearer_token) > 8 else 'SHORT_KEY'}"
+                f"Cloudonix x-cx-apikey validation failed. Received key ending "
+                f"with ...{_key_tail(api_key)}, expected key ending with "
+                f"...{_key_tail(self.bearer_token)} "
+                f"(matched config domain={self.domain_id}, "
+                f"application={self.application_name})"
             )
 
         return True  # TODO: update this post clarification from cloudonix
@@ -960,6 +1078,159 @@ class CloudonixProvider(TelephonyProvider):
         )
         return ProviderSyncResult(ok=True)
 
+    @staticmethod
+    def _dnid_matches_address(data: Any, expected: str) -> bool:
+        if not isinstance(data, dict):
+            return False
+
+        source = data.get("source")
+        if source is not None:
+            try:
+                source = normalize_telephony_address(str(source)).canonical
+            except ValueError:
+                source = str(source).strip()
+            if source == expected:
+                return True
+
+        dnid = data.get("dnid")
+        if not isinstance(dnid, str):
+            return False
+        escaped_address = re.escape(expected)
+        return dnid.strip() in {
+            expected,
+            f"^{escaped_address}$",
+            f"^({escaped_address})$",
+        }
+
+    async def provision_phone_number(self, address: str) -> ProviderSyncResult | None:
+        """Ensure ``address`` exists as a DNID on the configured application."""
+        if not (self.bearer_token and self.domain_id):
+            return ProviderSyncResult(
+                ok=False,
+                message="Cloudonix bearer token and domain are required to create a DNID",
+            )
+        if not self.application_name:
+            return ProviderSyncResult(
+                ok=False,
+                message=(
+                    "Cloudonix application_name is required to associate the "
+                    "new DNID with a Voice Application"
+                ),
+            )
+
+        expected = normalize_telephony_address(address).canonical
+        encoded_domain = quote(self.domain_id, safe="")
+        encoded_application = quote(self.application_name, safe="")
+        domain_endpoint = f"{self.base_url}/domains/{encoded_domain}"
+        dnids_endpoint = f"{domain_endpoint}/dnids"
+        application_endpoint = f"{domain_endpoint}/applications/{encoded_application}"
+        headers = self._get_auth_headers()
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(dnids_endpoint, headers=headers) as response:
+                    if response.status == 200:
+                        dnids = await response.json()
+                        if not isinstance(dnids, list):
+                            return ProviderSyncResult(
+                                ok=False,
+                                message=(
+                                    "Cloudonix dnidList response was not an array"
+                                ),
+                            )
+                        if any(
+                            self._dnid_matches_address(dnid, expected) for dnid in dnids
+                        ):
+                            return ProviderSyncResult(ok=True)
+                    elif response.status != 404:
+                        body = await response.text()
+                        return ProviderSyncResult(
+                            ok=False,
+                            message=(
+                                f"Cloudonix DNID list failed with HTTP "
+                                f"{response.status}: {body}"
+                            ),
+                        )
+
+                async with session.get(
+                    application_endpoint, headers=headers
+                ) as response:
+                    if response.status != 200:
+                        body = await response.text()
+                        return ProviderSyncResult(
+                            ok=False,
+                            message=(
+                                "Cloudonix Voice Application lookup failed with "
+                                f"HTTP {response.status}: {body}"
+                            ),
+                        )
+                    application = await response.json()
+
+                application_uuid = (
+                    application.get("uuid") if isinstance(application, dict) else None
+                )
+                if (
+                    not isinstance(application_uuid, str)
+                    or not application_uuid.strip()
+                ):
+                    return ProviderSyncResult(
+                        ok=False,
+                        message=(
+                            "Cloudonix applicationGet response did not include "
+                            "an application UUID"
+                        ),
+                    )
+                encoded_application_uuid = quote(application_uuid.strip(), safe="")
+                application_dnids_endpoint = (
+                    f"{domain_endpoint}/applications/{encoded_application_uuid}/dnids"
+                )
+
+                payload = {
+                    "source": expected,
+                    "prefix": False,
+                    "expression": False,
+                    "asteriskCompatible": False,
+                }
+                redacted_headers = {
+                    key: "Bearer [REDACTED]"
+                    if key.lower() == "authorization"
+                    else value
+                    for key, value in headers.items()
+                }
+                logger.info(
+                    f"[Cloudonix] dnidCreate request:\n"
+                    f"  Method: POST\n"
+                    f"  Endpoint: {application_dnids_endpoint}\n"
+                    f"  Headers: {json.dumps(redacted_headers, sort_keys=True)}\n"
+                    f"  Payload: {json.dumps(payload, sort_keys=True)}"
+                )
+                async with session.post(
+                    application_dnids_endpoint, json=payload, headers=headers
+                ) as response:
+                    if response.status not in (200, 201, 204):
+                        body = await response.text()
+                        return ProviderSyncResult(
+                            ok=False,
+                            message=(
+                                f"Cloudonix dnidCreate failed with HTTP "
+                                f"{response.status}: {body}"
+                            ),
+                        )
+        except Exception as e:
+            logger.error(
+                f"Exception provisioning Cloudonix DNID {expected} on domain "
+                f"{self.domain_id}: {e}"
+            )
+            return ProviderSyncResult(
+                ok=False, message=f"Cloudonix DNID provisioning failed: {e}"
+            )
+
+        logger.info(
+            f"Cloudonix DNID {expected} created on domain {self.domain_id} "
+            f"for Voice Application {self.application_name}"
+        )
+        return ProviderSyncResult(ok=True)
+
     async def validate_phone_number(self, address: str) -> ProviderSyncResult:
         """Verify that the address exists as a DNID in this Cloudonix domain."""
         if not (self.bearer_token and self.domain_id):
@@ -992,7 +1263,8 @@ class CloudonixProvider(TelephonyProvider):
                     if response.status != 200:
                         body = await response.text()
                         raise ProviderPhoneNumberLookupError(
-                            f"Cloudonix API {response.status}: {body}"
+                            f"Cloudonix API {response.status}: {body}",
+                            status_code=response.status,
                         )
                     data = await response.json()
         except ProviderPhoneNumberLookupError:
@@ -1002,13 +1274,7 @@ class CloudonixProvider(TelephonyProvider):
                 f"Cloudonix DNID lookup failed: {e}"
             ) from e
 
-        source = data.get("source")
-        if source is not None:
-            try:
-                source = normalize_telephony_address(str(source)).canonical
-            except ValueError:
-                source = str(source).strip()
-        if source == expected:
+        if self._dnid_matches_address(data, expected):
             return ProviderSyncResult(ok=True)
         return ProviderSyncResult(
             ok=False,
@@ -1172,8 +1438,8 @@ class CloudonixProvider(TelephonyProvider):
             "callback": callback_url,
             "timeout": timeout,
         }
-
         data.update(kwargs)
+        self._pin_trunk(data, from_number)
         headers = self._get_auth_headers()
         masked_destination = f"***{destination[-4:]}" if len(destination) > 4 else "***"
         logger.info(

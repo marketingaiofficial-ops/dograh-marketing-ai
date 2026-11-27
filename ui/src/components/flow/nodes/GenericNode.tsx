@@ -2,10 +2,12 @@ import { NodeProps, NodeToolbar, Position } from "@xyflow/react";
 import * as LucideIcons from "lucide-react";
 import { Check, Circle, Copy, Edit, type LucideIcon, Trash2Icon } from "lucide-react";
 import Link from "next/link";
+import posthog from "posthog-js";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { useWorkflow } from "@/app/workflow/[workflowId]/contexts/WorkflowContext";
+import { useWorkflowStore } from "@/app/workflow/[workflowId]/stores/workflowStore";
 import type { NodeSpec } from "@/client/types.gen";
 import { DocumentBadges } from "@/components/flow/DocumentBadges";
 import { NodeEditForm, useNodeSpecs } from "@/components/flow/renderer";
@@ -14,6 +16,7 @@ import { FlowNodeData } from "@/components/flow/types";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { NODE_DOCUMENTATION_URLS } from "@/constants/documentation";
+import { PostHogEvent } from "@/constants/posthog-events";
 import { useAppConfig } from "@/context/AppConfigContext";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
@@ -120,12 +123,20 @@ function resolveIntegrationSummary(
     spec: NodeSpec,
     data: FlowNodeData,
 ): string {
+    let hasSecret = false;
     for (const prop of spec.properties) {
-        if (
-            prop.name === "name" ||
-            prop.name.endsWith("enabled") ||
-            /api[_-]?key|token|secret/i.test(prop.name)
-        ) {
+        if (prop.name === "name" || prop.name.endsWith("enabled")) {
+            continue;
+        }
+        // A configured API key/token/secret is never displayed, but it does
+        // prove the node is set up. Remember that so a node whose only real
+        // config is a secret (e.g. an integration identified solely by its key)
+        // isn't mislabelled "Not configured".
+        if (/api[_-]?key|token|secret/i.test(prop.name)) {
+            const secret = data[prop.name];
+            if (typeof secret === "string" && secret.trim().length > 0) {
+                hasSecret = true;
+            }
             continue;
         }
 
@@ -137,7 +148,7 @@ function resolveIntegrationSummary(
             return String(value);
         }
     }
-    return "Not configured";
+    return hasSecret ? "Configured" : "Not configured";
 }
 
 function getBadgeForSpec(
@@ -175,15 +186,11 @@ function CanvasPreview({
     data,
     onCopyTrigger,
     triggerCopied,
-    onStaleTools,
-    onStaleDocuments,
 }: {
     spec: NodeSpec;
     data: FlowNodeData;
     onCopyTrigger: () => void;
     triggerCopied: boolean;
-    onStaleTools: (uuids: string[]) => void;
-    onStaleDocuments: (uuids: string[]) => void;
 }) {
     const { config: appConfig } = useAppConfig();
     if (spec.name === "trigger") {
@@ -291,7 +298,6 @@ function CanvasPreview({
                     </div>
                     <ToolBadges
                         toolUuids={data.tool_uuids}
-                        onStaleUuidsDetected={onStaleTools}
                         mcpToolFilters={data.mcp_tool_filters}
                     />
                 </div>
@@ -304,7 +310,6 @@ function CanvasPreview({
                     </div>
                     <DocumentBadges
                         documentUuids={data.document_uuids}
-                        onStaleUuidsDetected={onStaleDocuments}
                     />
                 </div>
             )}
@@ -483,6 +488,9 @@ export const GenericNode = memo(({ data, selected, id, type }: GenericNodeProps)
         id,
         additionalData,
     });
+    // Immutable creation origin, for manual edit/delete attribution.
+    const createdVia = useWorkflowStore((state) => state.createdVia);
+    const nodeWorkflowId = useWorkflowStore((state) => state.workflowId);
     const { saveWorkflow, tools, documents, recordings } = useWorkflow();
     const { bySpecName } = useNodeSpecs();
     const { config: appConfig } = useAppConfig();
@@ -533,34 +541,6 @@ export const GenericNode = memo(({ data, selected, id, type }: GenericNodeProps)
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [type]);
 
-    // ── Stale tool/document cleanup (was duplicated in Start/Agent) ─────
-    const handleStaleTools = useCallback(
-        async (staleUuids: string[]) => {
-            const cleaned = (data.tool_uuids ?? []).filter(
-                (u) => !staleUuids.includes(u),
-            );
-            handleSaveNodeData({
-                ...data,
-                tool_uuids: cleaned.length > 0 ? cleaned : undefined,
-            });
-            await saveWorkflow();
-        },
-        [data, handleSaveNodeData, saveWorkflow],
-    );
-    const handleStaleDocuments = useCallback(
-        async (staleUuids: string[]) => {
-            const cleaned = (data.document_uuids ?? []).filter(
-                (u) => !staleUuids.includes(u),
-            );
-            handleSaveNodeData({
-                ...data,
-                document_uuids: cleaned.length > 0 ? cleaned : undefined,
-            });
-            await saveWorkflow();
-        },
-        [data, handleSaveNodeData, saveWorkflow],
-    );
-
     // ── Dirty / save / open handlers ────────────────────────────────────
     const propertyNames = useMemo(
         () => spec?.properties.map((p) => p.name) ?? [],
@@ -583,6 +563,15 @@ export const GenericNode = memo(({ data, selected, id, type }: GenericNodeProps)
             ...data,
             ...(values as Partial<FlowNodeData>),
         });
+        // Only count real edits -- the dialog leaves Save enabled on no-op.
+        if (isDirty) {
+            posthog.capture(PostHogEvent.WORKFLOW_NODE_EDITED, {
+                node_type: type,
+                workflow_id: nodeWorkflowId,
+                workflow_origin: createdVia ?? "unknown",
+                source: "manual",
+            });
+        }
         setOpen(false);
         await saveWorkflow();
     };
@@ -642,8 +631,6 @@ export const GenericNode = memo(({ data, selected, id, type }: GenericNodeProps)
                         data={data}
                         onCopyTrigger={handleCopyTrigger}
                         triggerCopied={triggerCopied}
-                        onStaleTools={handleStaleTools}
-                        onStaleDocuments={handleStaleDocuments}
                     />
                 )}
             </NodeContent>
@@ -656,7 +643,15 @@ export const GenericNode = memo(({ data, selected, id, type }: GenericNodeProps)
                     {/* Start nodes can't be deleted (workflow always needs one). */}
                     {type !== "startCall" && (
                         <Button
-                            onClick={handleDeleteNode}
+                            onClick={() => {
+                                posthog.capture(PostHogEvent.WORKFLOW_NODE_DELETED, {
+                                    node_type: type,
+                                    workflow_id: nodeWorkflowId,
+                                    workflow_origin: createdVia ?? "unknown",
+                                    source: "manual",
+                                });
+                                handleDeleteNode();
+                            }}
                             variant="outline"
                             size="icon"
                         >

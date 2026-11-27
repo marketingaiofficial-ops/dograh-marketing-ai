@@ -1,14 +1,44 @@
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from api.enums import CallType
+
+
+class WorkflowLayoutNode(BaseModel):
+    id: str
+    type: str
+
+
+class WorkflowLayoutEdge(BaseModel):
+    source: str
+    target: str
+
+
+class WorkflowLayoutRequest(BaseModel):
+    """An unsaved canvas, reduced to what the layout needs."""
+
+    nodes: list[WorkflowLayoutNode] = Field(max_length=1000)
+    edges: list[WorkflowLayoutEdge] = Field(max_length=5000)
+    rankdir: Literal["TB", "LR"] = "TB"
+
+
+class WorkflowNodePosition(BaseModel):
+    id: str
+    x: float
+    y: float
+
+
+class WorkflowLayoutResponse(BaseModel):
+    positions: list[WorkflowNodePosition]
 
 
 class WorkflowRunResponseSchema(BaseModel):
     id: int
     workflow_id: int
+    workflow_name: str | None = None
+    version_number: int | None = None
     name: str
     mode: str
     created_at: datetime

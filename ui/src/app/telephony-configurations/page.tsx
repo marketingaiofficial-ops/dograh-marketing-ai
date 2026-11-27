@@ -12,6 +12,7 @@ import {
   Trash2,
 } from "lucide-react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 
@@ -26,6 +27,7 @@ import type {
   TelephonyConfigurationDetail,
   TelephonyConfigurationListItem,
 } from "@/client/types.gen";
+import { PageLayout, PageSection } from "@/components/layout/PageLayout";
 import { ConfigFormDialog } from "@/components/telephony/ConfigFormDialog";
 import {
   AlertDialog,
@@ -39,13 +41,6 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useTelephonyConfigWarnings } from "@/context/TelephonyConfigWarningsContext";
 import { detailFromError } from "@/lib/apiError";
@@ -54,6 +49,7 @@ import { copyTextToClipboard } from "@/lib/clipboard";
 
 export default function TelephonyConfigurationsPage() {
   const { user, getAccessToken, loading: authLoading } = useAuth();
+  const searchParams = useSearchParams();
   const {
     telnyxMissingWebhookPublicKeyCount,
     vonageMissingSignatureSecretCount,
@@ -97,6 +93,12 @@ export default function TelephonyConfigurationsPage() {
   useEffect(() => {
     fetchItems();
   }, [fetchItems]);
+
+  // ?add=1 lands the user straight on the provider form — used by the Phone
+  // Call dialog's "Add provider" action so the choice isn't asked twice.
+  useEffect(() => {
+    if (searchParams.get("add") === "1") setCreateOpen(true);
+  }, [searchParams]);
 
   const onEdit = async (item: TelephonyConfigurationListItem) => {
     try {
@@ -171,31 +173,19 @@ export default function TelephonyConfigurationsPage() {
   };
 
   return (
-    <div className="min-h-screen">
-      <div className="container mx-auto px-4 py-8">
-        <div className="flex items-start justify-between gap-4 mb-6">
-          <div>
-            <h1 className="text-3xl font-bold mb-2">Telephony configurations</h1>
-            <p className="text-muted-foreground">
-              Connect one or more telephony provider accounts. Each campaign uses one
-              configuration; inbound calls are routed to the right one by account ID.{" "}
-              <a
-                href="https://docs.dograh.com/integrations/telephony/overview"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-0.5 underline"
-              >
-                Learn more <ExternalLink className="h-3 w-3" />
-              </a>
-            </p>
-          </div>
-          <Button onClick={() => setCreateOpen(true)}>
-            <Plus className="h-4 w-4 mr-2" /> Add configuration
-          </Button>
-        </div>
-
+    <>
+      <PageLayout title="Telephony configurations" description={<>Connect one or more telephony provider accounts. Each campaign uses one
+        configuration; inbound calls are routed to the right one by account ID.{" "}
+        <a
+          href="https://docs.dograh.com/integrations/telephony/overview"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-0.5 underline"
+        >
+          Learn more <ExternalLink className="h-3 w-3" />
+        </a></>}>
         {telnyxMissingWebhookPublicKeyCount > 0 && (
-          <div className="mb-6 rounded-md border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+          <div className="rounded-md border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
             <div className="flex items-start gap-3">
               <AlertTriangle className="h-5 w-5 shrink-0 mt-0.5" />
               <div className="space-y-1 text-sm">
@@ -218,7 +208,7 @@ export default function TelephonyConfigurationsPage() {
         )}
 
         {vonageMissingSignatureSecretCount > 0 && (
-          <div className="mb-6 rounded-md border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+          <div className="rounded-md border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
             <div className="flex items-start gap-3">
               <AlertTriangle className="h-5 w-5 shrink-0 mt-0.5" />
               <div className="space-y-1 text-sm">
@@ -237,30 +227,24 @@ export default function TelephonyConfigurationsPage() {
           </div>
         )}
 
-        {loading ? (
-          <div className="grid gap-3">
-            <Skeleton className="h-24 w-full" />
-            <Skeleton className="h-24 w-full" />
-          </div>
-        ) : items.length === 0 ? (
-          <Card>
-            <CardHeader>
-              <CardTitle>No telephony configurations yet</CardTitle>
-              <CardDescription>
-                Add one to enable outbound calls and receive inbound calls.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <Button onClick={() => setCreateOpen(true)}>
-                <Plus className="h-4 w-4 mr-2" /> Add configuration
-              </Button>
-            </CardContent>
-          </Card>
-        ) : (
-          <div className="grid gap-3">
-            {items.map((item) => (
-              <Card key={item.id}>
-                <CardContent className="flex flex-col gap-4 py-4 sm:flex-row sm:items-center">
+        <PageSection title="Your Configurations"
+          description="Manage telephony provider accounts and their phone numbers."
+          actions={<Button onClick={() => setCreateOpen(true)}><Plus className="h-4 w-4" />Add configuration</Button>}>
+          {loading ? (
+            <div className="space-y-4">
+              <Skeleton className="h-24 w-full" />
+              <Skeleton className="h-24 w-full" />
+            </div>
+          ) : items.length === 0 ? (
+            <div className="py-12 text-center">
+              <p className="mb-2 font-medium">No telephony configurations yet</p>
+              <p className="mb-4 text-sm text-muted-foreground">Add one to enable outbound calls and receive inbound calls.</p>
+              <Button onClick={() => setCreateOpen(true)}><Plus className="h-4 w-4" />Add configuration</Button>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {items.map((item) => (
+                <div key={item.id} className="flex flex-col gap-4 rounded-lg border p-4 sm:flex-row sm:items-center">
                   <Link
                     href={`/telephony-configurations/${item.id}`}
                     className="flex flex-1 items-center gap-4 min-w-0"
@@ -278,6 +262,17 @@ export default function TelephonyConfigurationsPage() {
                         {item.inactive && (
                           <Badge variant="destructive">Inactive</Badge>
                         )}
+                        {!item.inactive &&
+                          item.supports_outbound !== false &&
+                          item.is_ready_for_outbound === false && (
+                          <Badge
+                            variant="outline"
+                            className="gap-1 border-amber-400 text-amber-700 dark:border-amber-700 dark:text-amber-400"
+                          >
+                            <AlertTriangle className="h-3 w-3" />
+                            Setup incomplete
+                          </Badge>
+                        )}
                       </div>
                       <span className="text-sm text-muted-foreground">
                         {item.phone_number_count} phone{" "}
@@ -287,6 +282,11 @@ export default function TelephonyConfigurationsPage() {
                         <span className="text-sm text-destructive">
                           Disabled after repeated connection failures
                           {item.inactive_reason ? `: ${item.inactive_reason}` : ""}
+                        </span>
+                      )}
+                      {!item.inactive && item.outbound_blocked_reason && (
+                        <span className="text-sm text-amber-700 dark:text-amber-500">
+                          {item.outbound_blocked_reason}
                         </span>
                       )}
                       <button
@@ -318,7 +318,7 @@ export default function TelephonyConfigurationsPage() {
                         Reactivate
                       </Button>
                     )}
-                    {!item.is_default_outbound && (
+                    {!item.is_default_outbound && item.supports_outbound !== false && (
                       <Button
                         variant="ghost"
                         size="sm"
@@ -354,17 +354,18 @@ export default function TelephonyConfigurationsPage() {
                       </Link>
                     </Button>
                   </div>
-                </CardContent>
-              </Card>
-            ))}
-          </div>
-        )}
-      </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </PageSection>
+      </PageLayout>
 
       <ConfigFormDialog
         open={createOpen}
         onOpenChange={setCreateOpen}
         existing={null}
+        suggestDefaultOutbound={!items.some((item) => item.is_default_outbound)}
         onSaved={onSaved}
       />
       <ConfigFormDialog
@@ -393,6 +394,6 @@ export default function TelephonyConfigurationsPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </div>
+    </>
   );
 }

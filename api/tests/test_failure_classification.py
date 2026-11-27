@@ -3,6 +3,9 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from loguru import logger
+from websockets.datastructures import Headers
+from websockets.exceptions import InvalidStatus
+from websockets.http11 import Response
 
 from api.errors import failure as failure_module
 from api.errors.failure import (
@@ -13,11 +16,94 @@ from api.errors.failure import (
     annotate_failure_metadata,
     classify_exception,
     classify_http_response,
+    describe_exception,
+    failure_already_reported,
     failure_metadata_for_processor,
     log_failure,
+    mark_failure_reported,
     redact_failure_message,
+    response_body_detail,
 )
 from api.services.configuration.registry import REGISTRY, ServiceType
+
+
+def _rejected_handshake(status_code: int, body: bytes) -> InvalidStatus:
+    return InvalidStatus(Response(status_code, "Rejected", Headers(), body))
+
+
+SPEED_REJECTION = (
+    b'{"err_code":"Bad Request","err_msg":"Requested model does not support '
+    b"the 'speed' parameter.\"}"
+)
+
+
+def test_rejected_handshake_reason_is_read_from_the_response_body():
+    # The library's own message names only the status; the reason the server
+    # gave is what lets a user fix their configuration.
+    exc = _rejected_handshake(400, SPEED_REJECTION)
+    reason = "Requested model does not support the 'speed' parameter."
+
+    assert reason not in str(exc)
+    assert response_body_detail(exc) == reason
+    assert describe_exception(exc) == f"{exc} ({reason})"
+
+    failure = classify_exception(exc, source=ErrorSource.TTS, provider="deepgram")
+
+    assert failure.type is ErrorType.CONFIG_ERROR
+    assert reason in failure.internal_message
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (b"", None),
+        (b"<html><body>Bad gateway</body></html>", None),
+        (b"  upstream \n  timed out \n", "upstream timed out"),
+        (b'{"error": {"message": "nested reason"}}', "nested reason"),
+        (b'{"status": "failed"}', '{"status": "failed"}'),
+        (b"x" * 500, "x" * 300),
+    ],
+)
+def test_response_body_detail_handles_other_body_shapes(body, expected):
+    assert response_body_detail(_rejected_handshake(502, body)) == expected
+
+
+def test_unreadable_response_attribute_never_masks_the_original_error():
+    class Flaky(Exception):
+        @property
+        def response(self):
+            raise RuntimeError("connection already closed")
+
+    exc = Flaky("boom")
+
+    assert response_body_detail(exc) is None
+    assert describe_exception(exc) == "boom"
+    failure = classify_exception(exc, source=ErrorSource.TTS, provider="deepgram")
+    assert "boom" in failure.internal_message
+
+
+def test_response_body_detail_is_redacted_before_it_leaves_the_server():
+    # The detail reaches the browser and the log sinks, so a proxy or provider
+    # that echoes credentials back must not leak them.
+    exc = _rejected_handshake(
+        401,
+        b'{"err_msg": "Authorization: Bearer abc.def-123 rejected; api_key=sk-live-999 revoked"}',
+    )
+
+    detail = response_body_detail(exc)
+
+    assert detail is not None
+    assert "abc.def-123" not in detail
+    assert "sk-live-999" not in detail
+    assert "[REDACTED]" in detail
+    assert "rejected" in detail
+
+
+def test_describe_exception_without_a_response_is_plain_str():
+    exc = RuntimeError("boom")
+
+    assert response_body_detail(exc) is None
+    assert describe_exception(exc) == "boom"
 
 
 @pytest.mark.parametrize(
@@ -32,7 +118,10 @@ from api.services.configuration.registry import REGISTRY, ServiceType
         (408, ErrorType.PROVIDER_ERROR, True),
         (500, ErrorType.PROVIDER_ERROR, True),
         (503, ErrorType.PROVIDER_ERROR, True),
-        (302, ErrorType.SYSTEM_ERROR, None),
+        # A redirect means the configured URL was the wrong one to give us.
+        (301, ErrorType.CONFIG_ERROR, False),
+        (302, ErrorType.CONFIG_ERROR, False),
+        (307, ErrorType.CONFIG_ERROR, False),
     ],
 )
 def test_classify_http_response_status_bands(status_code, expected_type, retryable):
@@ -47,12 +136,8 @@ def test_classify_http_response_status_bands(status_code, expected_type, retryab
     assert failure.type == expected_type
     assert failure.code == f"deepgram-{status_code}"
     assert failure.retryable is retryable
-    expected_owner = (
-        ErrorOwner.OPERATOR
-        if expected_type == ErrorType.SYSTEM_ERROR
-        else ErrorOwner.USER
-    )
-    assert failure.error_owner == expected_owner
+    # The caller declared the user, and nothing here overrides that.
+    assert failure.error_owner == ErrorOwner.USER
 
 
 @pytest.mark.parametrize(
@@ -63,7 +148,14 @@ def test_classify_http_response_status_bands(status_code, expected_type, retryab
         (ErrorType.PROVIDER_ERROR, ErrorOwner.USER, ErrorOwner.USER),
         (ErrorType.PROVIDER_ERROR, ErrorOwner.OPERATOR, ErrorOwner.OPERATOR),
         (ErrorType.PROVIDER_ERROR, None, ErrorOwner.OPERATOR),
-        (ErrorType.SYSTEM_ERROR, ErrorOwner.USER, ErrorOwner.OPERATOR),
+        # A seam that knows whose credentials were in play outranks the type:
+        # an unclassifiable error from a customer's provider is still theirs.
+        (ErrorType.SYSTEM_ERROR, ErrorOwner.USER, ErrorOwner.USER),
+        (ErrorType.SYSTEM_ERROR, ErrorOwner.OPERATOR, ErrorOwner.OPERATOR),
+        (ErrorType.SYSTEM_ERROR, None, ErrorOwner.OPERATOR),
+        # config/quota stay user-owned however the caller argues.
+        (ErrorType.CONFIG_ERROR, ErrorOwner.OPERATOR, ErrorOwner.USER),
+        (ErrorType.QUOTA_ERROR, ErrorOwner.OPERATOR, ErrorOwner.USER),
     ],
 )
 def test_failure_resolves_binary_owner(error_type, requested_owner, expected_owner):
@@ -457,3 +549,45 @@ def test_http_status_embedded_in_exception_text_is_classified(
 
     assert failure.type == expected_type
     assert failure.code == expected_code
+
+
+def test_reported_mark_travels_with_the_exception():
+    """One failure gets one report, however many layers it passes through."""
+    exc = RuntimeError("pipeline blew up")
+    assert failure_already_reported(exc) is False
+
+    mark_failure_reported(exc)
+
+    assert failure_already_reported(exc) is True
+
+
+def test_reported_mark_survives_a_reraise():
+    inner = ValueError("boom")
+
+    def failing_layer():
+        raise inner
+
+    def reporting_layer():
+        try:
+            failing_layer()
+        except Exception as e:
+            mark_failure_reported(e)
+            raise
+
+    with pytest.raises(ValueError) as caught:
+        reporting_layer()
+
+    # The outer catch-all can tell this was already accounted for.
+    assert failure_already_reported(caught.value) is True
+
+
+def test_marking_an_exception_that_rejects_attributes_is_survivable():
+    class _Unsettable(Exception):
+        def __setattr__(self, name, value):
+            raise AttributeError("attributes are not accepted")
+
+    exc = _Unsettable("no attribute storage")
+    mark_failure_reported(exc)
+
+    # Losing the mark costs a duplicate line; it must never raise.
+    assert failure_already_reported(exc) is False

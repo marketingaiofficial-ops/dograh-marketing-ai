@@ -1,7 +1,7 @@
-"""Drift guards between the static MCP guide and the live tool surface.
+"""Drift guards between authoring bootstraps and the live tool surfaces.
 
-`api/mcp_server/instructions.py` is free text baked into the client
-system prompt. It is *not* the authoritative description of the tools —
+`api/mcp_server/instructions.py` supplies guidance for MCP hosts to consume.
+It is *not* the authoritative description of the tools —
 names, signatures, and per-tool error codes reach the model dynamically
 via `tools/list`, derived from each tool's own function signature and
 docstring. These tests fail on the two classic drift modes:
@@ -17,6 +17,7 @@ the tools describe themselves.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -26,6 +27,18 @@ from api.mcp_server import instructions as instructions_module
 from api.mcp_server.server import mcp
 from api.mcp_server.tools import create_workflow as create_workflow_module
 from api.mcp_server.tools import save_workflow as save_workflow_module
+from api.mcp_server.tools import tool_creation as tool_creation_module
+from api.services import tool_management as tool_management_module
+from api.services.workflow.authoring import authoring_stage
+from api.services.workflow.authoring.contracts import AuthoringStage
+from api.services.workflow.builder import BUILDER_TOOLS
+from api.services.workflow.builder_runtime.agent import (
+    ALLOWED_TOOLS,
+    ITERATION_MCP_TOOLS,
+    STAGE_MCP_TOOLS,
+    builder_instructions,
+    local_tools,
+)
 
 # Every registered MCP tool name starts with one of these verbs. A
 # backticked snake_case token in the guide whose leading word is a verb is
@@ -46,6 +59,10 @@ _TOOL_VERB_PREFIXES = frozenset(
         "add",
         "remove",
         "set",
+        "ask",
+        "propose",
+        "submit",
+        "request",
     }
 )
 
@@ -71,6 +88,20 @@ def _referenced_tool_names(text: str) -> set[str]:
     }
 
 
+# Some tools surface a service-layer failure by re-raising the code off an
+# exception -- `_error_result(e.error_code, ...)` -- so the literal never
+# appears in the MCP module and the regexes above cannot see it. For those,
+# name the service functions on the tool's call path and the codes they raise
+# are collected from there too. Without this, `create_tool` shipped
+# `destination_not_found` to the model with no description of it.
+_SERVICE_ERROR_SOURCES: dict[str, tuple[object, frozenset[str]]] = {
+    "create_tool": (
+        tool_management_module,
+        frozenset({"create_tool_for_user", "validate_tool_references"}),
+    ),
+}
+
+
 def _returned_error_codes(module) -> set[str]:
     source = Path(module.__file__).read_text(encoding="utf-8")
     return set(_ERROR_RESULT_LITERAL_RE.findall(source)) | set(
@@ -78,10 +109,49 @@ def _returned_error_codes(module) -> set[str]:
     )
 
 
+def _service_error_codes(tool_name: str) -> set[str]:
+    """Error codes raised by the service functions a tool delegates to."""
+    entry = _SERVICE_ERROR_SOURCES.get(tool_name)
+    if entry is None:
+        return set()
+    module, function_names = entry
+
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    found: set[str] = set()
+    seen_functions: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name not in function_names:
+            continue
+        seen_functions.add(node.name)
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Raise)
+                and isinstance(inner.exc, ast.Call)
+                and getattr(inner.exc.func, "id", "") == "ToolManagementError"
+                and inner.exc.args
+                and isinstance(inner.exc.args[0], ast.Constant)
+            ):
+                found.add(inner.exc.args[0].value)
+
+    missing = sorted(function_names - seen_functions)
+    assert not missing, (
+        f"_SERVICE_ERROR_SOURCES[{tool_name!r}] names functions that no longer "
+        f"exist in {module.__name__}: {missing}. Update the mapping."
+    )
+    return found
+
+
 @pytest.mark.asyncio
 async def test_guide_only_references_registered_tools():
     registered = {tool.name for tool in await mcp.list_tools()}
     referenced = _referenced_tool_names(instructions_module.DOGRAH_MCP_INSTRUCTIONS)
+    for stage in AuthoringStage:
+        referenced |= _referenced_tool_names(authoring_stage(stage)["instructions"])
+        referenced |= _referenced_tool_names(
+            authoring_stage(stage, iteration=True)["instructions"]
+        )
 
     assert referenced, "no tool references extracted — the regex likely broke"
     unknown = sorted(referenced - registered)
@@ -93,11 +163,31 @@ async def test_guide_only_references_registered_tools():
 
 
 @pytest.mark.asyncio
+async def test_builder_guide_only_references_available_tools():
+    registered = {tool.name for tool in await mcp.list_tools()}
+    relayed = ALLOWED_TOOLS - {"preview_workflow", "test_workflow_scenario"}
+    assert relayed <= registered & BUILDER_TOOLS
+    for stage, stage_tools in STAGE_MCP_TOOLS.items():
+        for iteration in (False, True):
+            available = stage_tools | {
+                tool.name for tool in local_tools(stage, iteration=iteration)
+            }
+            if iteration and stage in ("build", "review"):
+                available |= ITERATION_MCP_TOOLS
+            referenced = _referenced_tool_names(
+                builder_instructions(stage, iteration=iteration)
+            )
+            assert referenced
+            assert not referenced - available, (stage, referenced - available)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "tool_name, module",
     [
         ("save_workflow", save_workflow_module),
         ("create_workflow", create_workflow_module),
+        ("create_tool", tool_creation_module),
     ],
 )
 async def test_tool_documents_every_error_code_it_returns(tool_name, module):
@@ -105,7 +195,7 @@ async def test_tool_documents_every_error_code_it_returns(tool_name, module):
         tool.name: tool.description or "" for tool in await mcp.list_tools()
     }
     description = descriptions[tool_name]
-    returned = _returned_error_codes(module)
+    returned = _returned_error_codes(module) | _service_error_codes(tool_name)
 
     assert returned, f"no error codes detected in {tool_name} source — regex broke"
     undocumented = sorted(code for code in returned if code not in description)

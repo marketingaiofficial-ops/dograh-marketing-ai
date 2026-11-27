@@ -8,6 +8,7 @@ Each row represents one provider account that an organization has connected
 from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional
 
+from loguru import logger
 from sqlalchemy import func, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.future import select
@@ -36,6 +37,25 @@ class TelephonyConfigurationClient(BaseDBClient):
             )
             return list(result.scalars().all())
 
+    async def list_outbound_telephony_configuration_candidates(
+        self, organization_id: int
+    ) -> List[TelephonyConfigurationModel]:
+        """Active outbound candidates, with an explicit default considered first."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(TelephonyConfigurationModel)
+                .where(
+                    TelephonyConfigurationModel.organization_id == organization_id,
+                    TelephonyConfigurationModel.inactive.is_(False),
+                )
+                .order_by(
+                    TelephonyConfigurationModel.is_default_outbound.desc(),
+                    TelephonyConfigurationModel.created_at,
+                    TelephonyConfigurationModel.id,
+                )
+            )
+            return list(result.scalars().all())
+
     async def get_telephony_configuration(
         self, config_id: int
     ) -> Optional[TelephonyConfigurationModel]:
@@ -43,41 +63,52 @@ class TelephonyConfigurationClient(BaseDBClient):
             return await session.get(TelephonyConfigurationModel, config_id)
 
     async def get_telephony_configuration_for_org(
-        self, config_id: int, organization_id: int
+        self,
+        config_id: int,
+        organization_id: int,
+        active_only: bool = True,
     ) -> Optional[TelephonyConfigurationModel]:
-        """Lookup scoped to an org — used to authorize per-org access."""
+        """Lookup scoped to an org, excluding parked configs by default.
+
+        Management flows that need to display, repair, or reactivate a parked
+        row must opt in with ``active_only=False``.
+        """
         async with self.async_session() as session:
-            result = await session.execute(
-                select(TelephonyConfigurationModel).where(
-                    TelephonyConfigurationModel.id == config_id,
-                    TelephonyConfigurationModel.organization_id == organization_id,
-                )
+            query = select(TelephonyConfigurationModel).where(
+                TelephonyConfigurationModel.id == config_id,
+                TelephonyConfigurationModel.organization_id == organization_id,
             )
+            if active_only:
+                query = query.where(TelephonyConfigurationModel.inactive.is_(False))
+            result = await session.execute(query)
             return result.scalars().first()
 
     async def get_default_telephony_configuration(
-        self, organization_id: int
+        self, organization_id: int, active_only: bool = True
     ) -> Optional[TelephonyConfigurationModel]:
+        """Return the default outbound config, if it is usable for routing."""
         async with self.async_session() as session:
-            result = await session.execute(
-                select(TelephonyConfigurationModel).where(
-                    TelephonyConfigurationModel.organization_id == organization_id,
-                    TelephonyConfigurationModel.is_default_outbound.is_(True),
-                )
+            query = select(TelephonyConfigurationModel).where(
+                TelephonyConfigurationModel.organization_id == organization_id,
+                TelephonyConfigurationModel.is_default_outbound.is_(True),
             )
+            if active_only:
+                query = query.where(TelephonyConfigurationModel.inactive.is_(False))
+            result = await session.execute(query)
             return result.scalars().first()
 
     async def list_telephony_configurations_by_provider(
-        self, organization_id: int, provider: str
+        self, organization_id: int, provider: str, active_only: bool = True
     ) -> List[TelephonyConfigurationModel]:
-        """Used by inbound matching to enumerate candidates of a given provider."""
+        """List provider configs usable for inbound matching by default."""
         async with self.async_session() as session:
-            result = await session.execute(
-                select(TelephonyConfigurationModel).where(
-                    TelephonyConfigurationModel.organization_id == organization_id,
-                    TelephonyConfigurationModel.provider == provider,
-                )
+            query = select(TelephonyConfigurationModel).where(
+                TelephonyConfigurationModel.organization_id == organization_id,
+                TelephonyConfigurationModel.provider == provider,
             )
+            if active_only:
+                query = query.where(TelephonyConfigurationModel.inactive.is_(False))
+            result = await session.execute(query)
             return list(result.scalars().all())
 
     async def count_telnyx_configs_missing_webhook_public_key(
@@ -150,6 +181,57 @@ class TelephonyConfigurationClient(BaseDBClient):
             )
             return list(result.scalars().all())
 
+    async def list_active_whatsapp_configurations_by_waba_id(
+        self, waba_id: str
+    ) -> list[TelephonyConfigurationModel]:
+        """Every active WhatsApp configuration whose credentials name this Business Account."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(TelephonyConfigurationModel).where(
+                    TelephonyConfigurationModel.provider == "whatsapp",
+                    TelephonyConfigurationModel.credentials.op("->>")("waba_id")
+                    == waba_id,
+                    TelephonyConfigurationModel.inactive.is_(False),
+                )
+            )
+            return list(result.scalars().all())
+
+    async def get_whatsapp_configuration_by_waba_id(
+        self, waba_id: str
+    ) -> Optional[TelephonyConfigurationModel]:
+        """The active WhatsApp configuration for this WhatsApp Business Account.
+
+        Meta's webhook names the account in ``entry[].id`` and carries no
+        tenant, so this is the only thing that routes a call to an
+        organization. Two active configurations claiming the same account is
+        therefore refused rather than guessed between.
+        """
+        rows = await self.list_active_whatsapp_configurations_by_waba_id(waba_id)
+        if len(rows) > 1:
+            ids = ", ".join(str(r.id) for r in rows)
+            logger.error(
+                f"[WhatsApp] waba_id={waba_id!r} matches "
+                f"{len(rows)} active configurations ({ids}); refusing to route."
+            )
+            return None
+        return rows[0] if rows else None
+
+    async def get_whatsapp_configuration_by_verify_token(
+        self, verify_token: str
+    ) -> Optional[TelephonyConfigurationModel]:
+        """Look up an active WhatsApp config matching a webhook verify token."""
+        async with self.async_session() as session:
+            stmt = select(TelephonyConfigurationModel).where(
+                TelephonyConfigurationModel.provider == "whatsapp",
+                TelephonyConfigurationModel.credentials.op("->>")(
+                    "webhook_verify_token"
+                )
+                == verify_token,
+                TelephonyConfigurationModel.inactive.is_(False),
+            )
+            result = await session.execute(stmt)
+            return result.scalars().first()
+
     async def set_telephony_configuration_inactive(
         self, config_id: int, organization_id: int, reason: str
     ) -> bool:
@@ -201,16 +283,17 @@ class TelephonyConfigurationClient(BaseDBClient):
         is_default_outbound: bool = False,
     ) -> TelephonyConfigurationModel:
         """Create a new config row. Duplicate-account guarding is the caller's
-        responsibility; this method does not enforce it."""
+        responsibility; this method does not enforce it.
+
+        Which configuration is the default outbound is the customer's choice,
+        so this stores exactly what the caller passed. The only write beyond
+        the new row is demoting the previous default when this one claims it —
+        part of honouring ``is_default_outbound=True``, since two defaults in
+        one organization would make ``get_default_telephony_configuration``
+        return an arbitrary row.
+        """
         async with self.async_session() as session:
-            existing_count = await session.scalar(
-                select(func.count(TelephonyConfigurationModel.id)).where(
-                    TelephonyConfigurationModel.organization_id == organization_id,
-                )
-            )
-            if existing_count == 0:
-                is_default_outbound = True
-            elif is_default_outbound:
+            if is_default_outbound:
                 await self._clear_default_outbound(session, organization_id)
 
             row = TelephonyConfigurationModel(

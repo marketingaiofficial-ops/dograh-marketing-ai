@@ -35,8 +35,7 @@ from api.services.tool_management import (
     build_tool_response,
     create_tool_for_user,
     refresh_mcp_tool_for_user,
-    validate_external_pbx_tool_definition,
-    validate_tool_credential_references,
+    validate_tool_references,
 )
 from api.services.tool_management import (
     populate_discovered_tools as _populate_discovered_tools,
@@ -244,8 +243,6 @@ async def test_tool(
 
     status = result.get("status", "error")
     status_code = result.get("status_code")
-    if status_code is not None and status_code >= 400:
-        status = "error"
 
     hint = _hint_for_status_code(status_code, configured_method)
 
@@ -253,13 +250,10 @@ async def test_tool(
     # matching live execution. URL variables remain in the body/query.
     resolved_arguments = {**request.preset_params, **request.llm_params}
 
-    # Mirror execute_http_tool's own branch: POST/PUT/PATCH send the
-    # resolved arguments as a JSON body; GET/DELETE send them as query
-    # params. Never both.
     request_body = None
     request_params = None
     if configured_method in ("POST", "PUT", "PATCH"):
-        request_body = resolved_arguments  # keep {} so preview matches wire request
+        request_body = result.get("request_body_preview", resolved_arguments)
     elif resolved_arguments:
         request_params = serialize_query_params(resolved_arguments)
 
@@ -323,9 +317,19 @@ def _hint_for_status_code(
             "necessarily a configuration problem."
         )
     if status_code == 415:
+        # Body Format only applies to methods that send a body; form-encoded
+        # owns its Content-Type, while JSON honours one set in Custom Headers.
+        if configured_method in ("POST", "PUT", "PATCH"):
+            return (
+                "HTTP 415 Unsupported Media Type — check the Body Format "
+                "setting (JSON or form-encoded) matches what this endpoint "
+                "expects. For a JSON body that needs a specific media type, "
+                "set Content-Type in Custom Headers."
+            )
         return (
-            "HTTP 415 Unsupported Media Type — check the Content-Type header "
-            "matches the format this endpoint expects for the body."
+            "HTTP 415 Unsupported Media Type — this request sends no body, so "
+            "check the Content-Type in Custom Headers is present and matches "
+            "what this endpoint expects."
         )
     if status_code == 422:
         return (
@@ -375,19 +379,7 @@ async def update_tool(
     if request.definition:
         definition = request.definition.model_dump()
         try:
-            existing_tool = await db_client.get_tool_by_uuid(
-                tool_uuid,
-                user.selected_organization_id,
-                include_archived=True,
-            )
-            await validate_external_pbx_tool_definition(
-                definition,
-                organization_id=user.selected_organization_id,
-                existing_definition=(
-                    existing_tool.definition if existing_tool else None
-                ),
-            )
-            await validate_tool_credential_references(
+            await validate_tool_references(
                 definition,
                 organization_id=user.selected_organization_id,
             )

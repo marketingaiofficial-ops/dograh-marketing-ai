@@ -46,6 +46,8 @@ class DeferredTunerObserver(Observer):
         llm_model: str = "",
         tts_model: str = "",
         agent_version: int | None = None,
+        sip_call_id: str | None = None,
+        sip_headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(
             api_key=_DEFERRED_API_KEY,
@@ -58,6 +60,12 @@ class DeferredTunerObserver(Observer):
             llm_model=llm_model,
             tts_model=tts_model,
             agent_version=agent_version,
+            sip_call_id=sip_call_id,
+            sip_headers=sip_headers,
+            # The SDK forwards OTel spans to Tuner by default and attaches to an
+            # existing tracer provider (Langfuse). The placeholder api_key can't
+            # authenticate those exports, so keep spans out of Tuner.
+            forward_traces=False,
         )
 
     async def _flush(self) -> None:

@@ -35,16 +35,18 @@
     // Chat widget state (widgetType === 'chat'). The server transcript is the
     // source of truth: every successful response full-replaces turns/revision.
     chat: {
-      status: 'idle', // idle | starting | ready | waiting | ended | expired | error
+      status: 'idle', // idle | starting | ready | waiting | recovering | ended | expired | error
+      isCompleted: false,
       panelOpen: false,
       revision: null,
       turns: [],
       pendingUserText: null, // optimistic bubble while a POST is in flight
+      pendingSubmission: null, // retain text/revision until acceptance is known
       ending: false,
       confirmingEnd: false,
       draft: '',
       banner: null,
-      seenAssistantTurnIds: new Set() // for onMessage diffing
+      seenAssistantMessageIds: new Set() // for onMessage diffing
     },
     chatEls: null, // { panel, messages, banner, input, sendBtn, endBtn, endConfirmation, confirmEndBtn } — null in headless
     callbacks: {
@@ -153,6 +155,10 @@
       // Merge fetched configuration with defaults
       state.config = {
         ...state.config,
+        // Visitor-facing copy, resolved server-side from the agent owner's
+        // settings. api/schemas/widget_texts.py owns the defaults; this file
+        // deliberately carries none so the two can never drift.
+        texts: configData.texts || {},
         workflowId: configData.workflow_id,
         widgetType: widgetType,
         embedMode: configData.settings?.embedMode || 'floating',
@@ -246,6 +252,20 @@
       console.warn('Dograh Widget: Invalid context variables', e);
       return {};
     }
+  }
+
+  /**
+   * Look up a visitor-facing label. The server always sends the full set, so a
+   * miss means the API is older than this script — warn rather than render
+   * "undefined" into the panel.
+   */
+  function widgetText(key) {
+    const value = state.config.texts && state.config.texts[key];
+    if (typeof value !== 'string') {
+      console.warn(`Dograh Widget: no text supplied for "${key}"`);
+      return '';
+    }
+    return value;
   }
 
   /**
@@ -363,9 +383,9 @@
 
   function ctaLabelForStatus(status) {
     switch (status) {
-      case 'connecting': return 'Connecting…';
-      case 'connected':  return 'End Call';
-      case 'failed':     return 'Retry';
+      case 'connecting': return widgetText('voiceConnectingText');
+      case 'connected':  return widgetText('voiceEndCallText');
+      case 'failed':     return widgetText('voiceRetryText');
       default:           return state.config.buttonText || 'Talk to Agent';
     }
   }
@@ -494,11 +514,13 @@
         margin: 0 auto 20px;
       }
 
+      /* Inherit the host page's text color: this panel sits directly in their
+         content, so a hardcoded near-black heading disappears on a dark site. */
       .dograh-inline-status-text {
         font-size: 18px;
         font-weight: 500;
         margin: 0 0 8px;
-        color: #111827;
+        color: inherit;
       }
 
       .dograh-inline-status-subtext {
@@ -526,7 +548,11 @@
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
       }
 
+      /* Host pages commonly style button:hover, which out-specifies the color
+         above and can repaint the label to match its own background — the same
+         reason .dograh-widget-cta:hover pins its color. */
       .dograh-inline-btn:hover {
+        color: #ffffff !important;
         transform: translateY(-2px);
         box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
       }
@@ -539,8 +565,11 @@
         background: #10b981;
       }
 
+      /* The start button carries the owner's configured color as an inline
+         style, so a fixed hover background would never apply — brighten
+         whatever color it has instead. */
       .dograh-inline-btn-start:hover {
-        background: #059669;
+        filter: brightness(1.08);
       }
 
       .dograh-inline-btn-end {
@@ -594,35 +623,27 @@
 
     // Determine display text
     const displayText = text || {
-      idle: 'Ready to Connect',
-      connecting: 'Connecting...',
-      connected: 'Call Active',
-      failed: 'Connection Failed'
+      idle: widgetText('voiceReadyTitle'),
+      connecting: widgetText('voiceConnectingText'),
+      connected: widgetText('voiceConnectedTitle'),
+      failed: widgetText('voiceConnectionFailedTitle')
     }[status];
 
     const displaySubtext = subtext || {
       idle: state.config.callToActionText,
-      connecting: 'Please wait while we establish connection',
-      connected: 'You can speak now',
-      failed: 'Please check your microphone and try again'
+      connecting: widgetText('voiceConnectingSubtext'),
+      connected: widgetText('voiceConnectedSubtext'),
+      failed: widgetText('voiceConnectionFailedSubtext')
     }[status];
 
-    // Simple button design: green to start, red to end
+    // Simple button design: green to start, red to end. Labels and colors are
+    // agent-owner configured, so they are assigned as text/style properties
+    // below rather than interpolated into this markup.
     let buttonHTML = '';
     if (status === 'idle' || status === 'failed') {
-      // Button to start with configured color
-      buttonHTML = `
-        <button class="dograh-inline-btn dograh-inline-btn-start" id="dograh-inline-start-btn" style="background: ${state.config.buttonColor};">
-          ${status === 'failed' ? 'Retry' : state.config.buttonText}
-        </button>
-      `;
+      buttonHTML = '<button class="dograh-inline-btn dograh-inline-btn-start" id="dograh-inline-start-btn"></button>';
     } else if (status === 'connecting' || status === 'connected') {
-      // Red button to end
-      buttonHTML = `
-        <button class="dograh-inline-btn dograh-inline-btn-end" id="dograh-inline-end-btn">
-          End Call
-        </button>
-      `;
+      buttonHTML = '<button class="dograh-inline-btn dograh-inline-btn-end" id="dograh-inline-end-btn"></button>';
     }
 
     // Update container content (preserve audio element)
@@ -632,13 +653,17 @@
         <div class="dograh-inline-status-icon ${status === 'connecting' ? 'dograh-inline-pulse' : ''}">
           ${getStatusIcon(status)}
         </div>
-        <p class="dograh-inline-status-text">${displayText}</p>
-        <p class="dograh-inline-status-subtext">${displaySubtext}</p>
+        <p class="dograh-inline-status-text"></p>
+        <p class="dograh-inline-status-subtext"></p>
         <div class="dograh-inline-button-container">
           ${buttonHTML}
         </div>
       </div>
     `;
+
+    // XSS boundary: configured copy only ever flows through textContent
+    container.querySelector('.dograh-inline-status-text').textContent = displayText;
+    container.querySelector('.dograh-inline-status-subtext').textContent = displaySubtext;
 
     // Re-append audio element
     if (audioElement) {
@@ -647,10 +672,17 @@
 
     // Attach event handlers
     const startBtn = document.getElementById('dograh-inline-start-btn');
-    if (startBtn) startBtn.onclick = startCall;
+    if (startBtn) {
+      startBtn.textContent = status === 'failed' ? widgetText('voiceRetryText') : state.config.buttonText;
+      startBtn.style.background = state.config.buttonColor;
+      startBtn.onclick = startCall;
+    }
 
     const endBtn = document.getElementById('dograh-inline-end-btn');
-    if (endBtn) endBtn.onclick = stopCall;
+    if (endBtn) {
+      endBtn.textContent = widgetText('voiceEndCallText');
+      endBtn.onclick = stopCall;
+    }
 
     // Trigger status change callback
     if (state.callbacks.onStatusChange) {
@@ -733,7 +765,7 @@
    */
   async function startCall() {
     state.gracefulDisconnect = false;
-    updateStatus('connecting', 'Connecting...', 'Please wait while we establish the connection');
+    updateStatus('connecting', widgetText('voiceConnectingText'), widgetText('voiceConnectingSubtext'));
 
     if (state.callbacks.onCallStart) {
       state.callbacks.onCallStart();
@@ -760,7 +792,7 @@
         state.stream = stream;
       } catch (micError) {
         // Handle specific microphone permission errors
-        let errorMessage = 'Please check your microphone and try again';
+        let errorMessage = widgetText('voiceConnectionFailedSubtext');
 
         if (micError.name === 'NotAllowedError' || micError.name === 'PermissionDeniedError') {
           errorMessage = 'Microphone permission denied. Please allow microphone access to start the call.';
@@ -809,7 +841,11 @@
         }
       }
 
-      updateStatus('failed', 'Connection failed', error.message || 'Please check your microphone and try again');
+      updateStatus(
+        'failed',
+        widgetText('voiceConnectionFailedTitle'),
+        error.message || widgetText('voiceConnectionFailedSubtext')
+      );
 
       // Trigger error callback
       if (state.callbacks.onError) {
@@ -892,8 +928,12 @@
    * Create WebRTC peer connection
    */
   function createWebRTCConnection() {
-    // Build ICE servers list
-    const iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
+    // A `stun:` entry can only yield srflx, never relay — and srflx has been
+    // seen leaking through iceTransportPolicy: 'relay', so skip it entirely.
+    // Same skip as the main app's useWebSocketRTC hook.
+    const iceServers = state.config.forceTurnRelay
+      ? []
+      : [{ urls: ['stun:stun.l.google.com:19302'] }];
 
     // Add TURN server if credentials are available
     if (state.turnCredentials && state.turnCredentials.uris && state.turnCredentials.uris.length > 0) {
@@ -903,6 +943,16 @@
         credential: state.turnCredentials.password
       });
       console.log(`TURN server configured with ${state.turnCredentials.uris.length} URIs`);
+    }
+
+    // Reachable: turn_enabled and force_turn_relay are independent, so
+    // FORCE_TURN_RELAY=true with TURN_SECRET unset (or a failed credentials
+    // fetch) leaves no ICE servers at all — no candidates, and no clue why.
+    if (state.config.forceTurnRelay && iceServers.length === 0) {
+      console.error(
+        'Dograh Widget: FORCE_TURN_RELAY is on but no TURN credentials are ' +
+        'available — ICE has no candidates to gather and this call cannot connect.'
+      );
     }
 
     const config = {
@@ -948,7 +998,7 @@
 
     if (pc.connectionState === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
       const wasAlreadyConnected = state.callStartedAt !== null;
-      updateStatus('connected', 'Connected', 'Your voice call is now active');
+      updateStatus('connected', widgetText('voiceConnectedTitle'), widgetText('voiceConnectedSubtext'));
       if (!wasAlreadyConnected) {
         state.callStartedAt = Date.now();
         if (state.callbacks.onCallConnected) {
@@ -966,8 +1016,8 @@
       stopCall({
         graceful: false,
         status: 'failed',
-        text: 'Connection lost',
-        subtext: 'The call has been disconnected'
+        text: widgetText('voiceConnectionLostTitle'),
+        subtext: widgetText('voiceConnectionLostSubtext')
       });
       return;
     }
@@ -1031,7 +1081,7 @@
         }
 
         if (state.connectionStatus === 'connected' && !state.gracefulDisconnect) {
-          updateStatus('failed', 'Connection lost', 'The call has been disconnected');
+          updateStatus('failed', widgetText('voiceConnectionLostTitle'), widgetText('voiceConnectionLostSubtext'));
         }
       };
 
@@ -1121,8 +1171,8 @@
     const graceful = options.graceful !== false;
     const closeWebSocket = options.closeWebSocket !== false;
     const status = options.status || 'idle';
-    const text = options.text || 'Call ended';
-    const subtext = options.subtext || 'Click below to start a new call';
+    const text = options.text || widgetText('voiceCallEndedTitle');
+    const subtext = options.subtext || widgetText('voiceCallEndedSubtext');
 
     state.gracefulDisconnect = graceful;
 
@@ -1181,7 +1231,7 @@
    * Retry connection
    */
   function retryCall() {
-    updateStatus('idle', 'Ready to start', 'Click below to begin your voice call');
+    updateStatus('idle', widgetText('voiceReadyTitle'), state.config.callToActionText);
     setTimeout(() => startCall(), 500);
   }
 
@@ -1458,14 +1508,23 @@
         background: #ffffff;
         flex: 0 0 auto;
       }
+      /* The input and the send button must be the same height at rest, so pin
+         every box metric the host page could otherwise decide for us:
+         box-sizing (a host content-box reset inflates the textarea) and
+         line-height (font: inherit picks up the host's, which is what makes
+         the two sides disagree). 20 + 8*2 padding + 1*2 border = 38, the
+         shared height below. */
       .dograh-chat-input {
         flex: 1;
+        box-sizing: border-box;
         resize: none;
         border: 1px solid #d1d5db;
         border-radius: 8px;
         padding: 8px 10px;
         font: inherit;
         font-size: 14px;
+        line-height: 20px;
+        min-height: 38px;
         max-height: 96px;
         outline: none;
         background: #ffffff;
@@ -1474,8 +1533,10 @@
       .dograh-chat-input:focus { border-color: #9ca3af; }
       .dograh-chat-input:disabled { background: #f9fafb; color: #9ca3af; }
       .dograh-chat-send {
-        width: 36px;
-        height: 36px;
+        box-sizing: border-box;
+        width: 38px;
+        height: 38px;
+        padding: 0;
         border: none;
         border-radius: 8px;
         color: #ffffff;
@@ -1483,6 +1544,12 @@
         display: inline-flex;
         align-items: center;
         justify-content: center;
+        flex: 0 0 auto;
+      }
+      .dograh-chat-send svg {
+        display: block;
+        width: 16px;
+        height: 16px;
         flex: 0 0 auto;
       }
       .dograh-chat-send:disabled { opacity: 0.5; cursor: default; }
@@ -1514,6 +1581,17 @@
         color: #ffffff;
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
       }
+      .dograh-chat-inline-start:hover { filter: brightness(1.08); }
+
+      /* A host page's own button:hover rule out-specifies the colors set above
+         and can repaint a label to match its background, hiding it. Pin every
+         button color we own against that. */
+      .dograh-chat-end:hover,
+      .dograh-chat-close:hover,
+      .dograh-chat-send:hover,
+      .dograh-chat-inline-start:hover { color: #ffffff !important; }
+      .dograh-chat-end-confirm-cancel:hover { color: #374151 !important; }
+      .dograh-chat-restart:hover { color: #1d4ed8 !important; }
     `;
 
     const styleSheet = document.createElement('style');
@@ -1546,7 +1624,7 @@
     const endBtn = document.createElement('button');
     endBtn.className = 'dograh-chat-end';
     endBtn.type = 'button';
-    endBtn.textContent = 'End chat';
+    endBtn.textContent = widgetText('endChatText');
     endBtn.setAttribute('aria-controls', 'dograh-chat-end-confirmation');
     endBtn.setAttribute('aria-expanded', 'false');
     endBtn.onclick = () => {
@@ -1560,7 +1638,7 @@
       const closeBtn = document.createElement('button');
       closeBtn.className = 'dograh-chat-close';
       closeBtn.type = 'button';
-      closeBtn.setAttribute('aria-label', 'Close chat');
+      closeBtn.setAttribute('aria-label', widgetText('closeChatLabel'));
       closeBtn.textContent = '×';
       closeBtn.onclick = closeChatPanel;
       headerActions.appendChild(closeBtn);
@@ -1575,7 +1653,7 @@
     endConfirmation.setAttribute('aria-label', 'Confirm ending chat');
 
     const endConfirmationText = document.createElement('span');
-    endConfirmationText.textContent = 'End this chat?';
+    endConfirmationText.textContent = widgetText('endChatConfirmText');
     endConfirmation.appendChild(endConfirmationText);
 
     const endConfirmActions = document.createElement('div');
@@ -1584,7 +1662,7 @@
     const cancelEndBtn = document.createElement('button');
     cancelEndBtn.className = 'dograh-chat-end-confirm-cancel';
     cancelEndBtn.type = 'button';
-    cancelEndBtn.textContent = 'Cancel';
+    cancelEndBtn.textContent = widgetText('endChatCancelText');
     cancelEndBtn.onclick = () => {
       state.chat.confirmingEnd = false;
       renderChat();
@@ -1597,7 +1675,7 @@
     const confirmEndBtn = document.createElement('button');
     confirmEndBtn.className = 'dograh-chat-end-confirm-submit';
     confirmEndBtn.type = 'button';
-    confirmEndBtn.textContent = 'End chat';
+    confirmEndBtn.textContent = widgetText('endChatText');
     confirmEndBtn.onclick = () => {
       state.chat.confirmingEnd = false;
       endChatSession();
@@ -1620,7 +1698,7 @@
     const input = document.createElement('textarea');
     input.className = 'dograh-chat-input';
     input.rows = 1;
-    input.placeholder = 'Type a message…';
+    input.placeholder = widgetText('chatInputPlaceholder');
     input.oninput = () => {
       state.chat.draft = input.value;
       autoGrowChatInput(input);
@@ -1635,7 +1713,7 @@
     sendBtn.className = 'dograh-chat-send';
     sendBtn.type = 'button';
     sendBtn.style.backgroundColor = state.config.buttonColor;
-    sendBtn.setAttribute('aria-label', 'Send message');
+    sendBtn.setAttribute('aria-label', widgetText('sendMessageLabel'));
     sendBtn.innerHTML = SEND_ICON_SVG; // static markup, never user data
     sendBtn.onclick = submitChatComposer;
     composer.appendChild(input);
@@ -1656,8 +1734,12 @@
   }
 
   function autoGrowChatInput(input) {
+    // scrollHeight covers content + padding but not borders, and the input is
+    // border-box — without adding them back the first keystroke shrinks the
+    // box by 2px and clips the text.
+    const BORDER_Y = 2; // 1px top + 1px bottom, matches .dograh-chat-input
     input.style.height = 'auto';
-    input.style.height = Math.min(input.scrollHeight, 96) + 'px';
+    input.style.height = Math.min(input.scrollHeight + BORDER_Y, 96) + 'px';
   }
 
   /**
@@ -1786,6 +1868,8 @@
     }
     if (state.chat.status === 'idle' || state.chat.status === 'error') {
       await startChatSession();
+    } else if (state.chat.status === 'recovering') {
+      await recoverChatSession();
     } else {
       renderChat();
     }
@@ -1795,11 +1879,13 @@
     state.sessionToken = null;
     state.workflowRunId = null;
     state.chat.revision = null;
+    state.chat.isCompleted = false;
     state.chat.turns = [];
     state.chat.pendingUserText = null;
     state.chat.ending = false;
+    state.chat.pendingSubmission = null;
     state.chat.confirmingEnd = false;
-    state.chat.seenAssistantTurnIds = new Set();
+    state.chat.seenAssistantMessageIds = new Set();
   }
 
   async function startNewChatSession() {
@@ -1813,14 +1899,14 @@
 
   /**
    * Initialize the embed session for chat. The server derives the run type
-   * from the token settings and returns the greeting transcript inline.
+   * from the token settings and streams the opening messages as they arrive.
    */
   async function startChatSession() {
     if (state.chat.status === 'starting') return;
     updateChatStatus('starting');
 
     try {
-      const response = await fetch(`${state.config.apiBaseUrl}/api/v1/public/embed/init`, {
+      const response = await fetch(`${state.config.apiBaseUrl}/api/v1/public/embed/init/stream`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1840,14 +1926,15 @@
         throw new Error(`Failed to start chat: ${response.status}`);
       }
 
-      const data = await response.json();
-      state.sessionToken = data.session_token;
-      state.workflowRunId = data.workflow_run_id;
-      const completed = applyChatSession(data.chat_session);
-      updateChatStatus(completed ? 'ended' : 'ready', completed ? 'Conversation ended.' : null);
+      await readChatStream(response);
+      finishChatResponse();
     } catch (error) {
       console.error('Dograh Widget: Failed to start chat', error);
-      updateChatStatus('error', 'Could not start the chat.');
+      if (state.sessionToken) {
+        await recoverChatSession();
+      } else {
+        updateChatStatus('error', 'Could not start the chat.');
+      }
       if (state.callbacks.onError) {
         state.callbacks.onError(error);
       }
@@ -1861,21 +1948,128 @@
   function applyChatSession(chatSession) {
     if (!chatSession) return false;
     state.chat.revision = chatSession.revision;
-    state.chat.turns = chatSession.turns || [];
+    state.chat.isCompleted = Boolean(chatSession.is_completed);
+    // Pending snapshots have no saved speech yet. Preserve messages delivered
+    // before a disconnect until the final, authoritative transcript is saved.
+    state.chat.turns = (chatSession.turns || []).map((turn) => {
+      const previous = state.chat.turns.find((candidate) => candidate.id === turn.id);
+      if (turn.status === 'pending' && previous && previous.assistant_messages) {
+        return { ...turn, assistant_messages: previous.assistant_messages };
+      }
+      return turn;
+    });
     state.chat.pendingUserText = null;
     notifyNewAssistantMessages();
-    return Boolean(chatSession.is_completed);
+    return state.chat.isCompleted;
+  }
+
+  function assistantMessages(turn) {
+    if (Array.isArray(turn.assistant_messages)) return turn.assistant_messages;
+    return turn.assistant_message ? [turn.assistant_message] : [];
   }
 
   function notifyNewAssistantMessages() {
     state.chat.turns.forEach((turn) => {
-      if (turn.status !== 'completed' || !turn.assistant_message || !turn.assistant_message.text) return;
-      if (state.chat.seenAssistantTurnIds.has(turn.id)) return;
-      state.chat.seenAssistantTurnIds.add(turn.id);
-      if (state.callbacks.onMessage) {
-        state.callbacks.onMessage(turn.assistant_message.text, turn);
-      }
+      assistantMessages(turn).forEach((message, index) => {
+        if (!message || !message.text) return;
+        const id = `${turn.id}:${index}`;
+        if (state.chat.seenAssistantMessageIds.has(id)) return;
+        state.chat.seenAssistantMessageIds.add(id);
+        if (state.callbacks.onMessage) {
+          state.callbacks.onMessage(message.text, turn);
+        }
+      });
     });
+  }
+
+  function finishChatResponse() {
+    const pending = state.chat.turns.some((turn) => turn.status === 'pending');
+    const failed = state.chat.turns.length && state.chat.turns[state.chat.turns.length - 1].status === 'failed';
+    updateChatStatus(
+      state.chat.isCompleted ? 'ended' : pending ? 'waiting' : 'ready',
+      state.chat.isCompleted ? widgetText('conversationEndedText') : failed ? 'Assistant failed to respond.' : null
+    );
+  }
+
+  async function readChatStream(response) {
+    if (!response.body) throw new Error('Chat streaming is unavailable');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let data = [];
+    let completed = false;
+
+    function dispatch() {
+      if (!data.length) return;
+      const event = JSON.parse(data.join('\n'));
+      data = [];
+      if (event.type === 'session' || event.type === 'complete') {
+        if (event.session_token) state.sessionToken = event.session_token;
+        if (event.workflow_run_id) state.workflowRunId = event.workflow_run_id;
+        applyChatSession(event.session);
+        completed = event.type === 'complete';
+      } else if (event.type === 'message') {
+        const turn = state.chat.turns.find((candidate) => candidate.id === event.turn_id);
+        if (turn) {
+          if (!Array.isArray(turn.assistant_messages)) turn.assistant_messages = [];
+          turn.assistant_messages[event.index] = event.message;
+          notifyNewAssistantMessages();
+        }
+      } else if (event.type === 'error') {
+        throw new Error(event.message || 'Assistant failed to respond');
+      }
+      renderChat();
+    }
+
+    try {
+      while (!completed) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        let newline;
+        while ((newline = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newline).replace(/\r$/, '');
+          buffer = buffer.slice(newline + 1);
+          if (line === '') dispatch();
+          else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+        }
+        if (done) break;
+      }
+      if (!completed) throw new Error('Chat stream ended before the response finished');
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+  }
+
+  async function recoverChatSession() {
+    // An accepted POST keeps executing after disconnect. Only GET is retried;
+    // replaying the visitor message could run a tool twice.
+    let failures = 0;
+    updateChatStatus('waiting', 'Reconnecting…');
+    while (state.sessionToken) {
+      if (await resyncChatSession()) {
+        failures = 0;
+        const submission = state.chat.pendingSubmission;
+        const notAccepted = submission && state.chat.revision === submission.revision;
+        if (submission) {
+          if (notAccepted) state.chat.draft = submission.text;
+          state.chat.pendingSubmission = null;
+        }
+        finishChatResponse();
+        if (notAccepted && state.chat.status === 'ready') {
+          updateChatStatus('ready', 'Message not sent — please try again.');
+        }
+        if (state.chat.status !== 'waiting') return true;
+      } else if (state.chat.status === 'expired') {
+        updateChatStatus('expired');
+        return false;
+      } else if (++failures >= 3) {
+        updateChatStatus('recovering', 'Connection interrupted. Reconnect to check the response.');
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return false;
   }
 
   /**
@@ -1893,16 +2087,17 @@
       console.warn('Dograh Widget: no active chat session');
       return null;
     }
-    if (state.chat.status === 'waiting' || state.chat.status === 'starting') {
+    if (state.chat.status === 'waiting' || state.chat.status === 'starting' || state.chat.status === 'recovering') {
       return null; // one turn at a time; the composer is disabled anyway
     }
 
     state.chat.pendingUserText = trimmed;
+    state.chat.pendingSubmission = { text: trimmed, revision: state.chat.revision };
     updateChatStatus('waiting');
 
     try {
       const response = await fetch(
-        `${state.config.apiBaseUrl}/api/v1/public/embed/chat/${state.sessionToken}/messages`,
+        `${state.config.apiBaseUrl}/api/v1/public/embed/chat/${state.sessionToken}/messages/stream`,
         {
           method: 'POST',
           headers: {
@@ -1914,50 +2109,50 @@
       );
 
       if (response.ok) {
-        const data = await response.json();
-        const completed = applyChatSession(data);
-        updateChatStatus(completed ? 'ended' : 'ready', completed ? 'Conversation ended.' : null);
+        await readChatStream(response);
+        state.chat.pendingSubmission = null;
+        finishChatResponse();
         return state.chat.turns;
       }
 
       state.chat.pendingUserText = null;
 
       if (response.status === 409) {
-        // Someone else advanced the session (e.g. a second tab). Resync the
-        // transcript and hand the text back as a draft.
-        const resynced = await resyncChatSession();
-        if (!resynced && state.chat.status === 'expired') {
-          updateChatStatus('expired');
-          return null;
-        }
+        state.chat.pendingSubmission = null;
         state.chat.draft = trimmed;
-        updateChatStatus('ready', 'Message not sent — please try again.');
+        await recoverChatSession();
+        if (state.chat.status === 'ready') {
+          updateChatStatus('ready', 'Message not sent — please try again.');
+        }
         return null;
       }
       if (response.status === 402) {
+        state.chat.pendingSubmission = null;
         updateChatStatus('ended', 'The agent is unavailable right now.');
         return null;
       }
       if (response.status === 429) {
+        state.chat.pendingSubmission = null;
         updateChatStatus('ended', 'Message limit reached for this conversation.');
         return null;
       }
       if (response.status === 403 || response.status === 404) {
+        state.chat.pendingSubmission = null;
         // The 1-hour embed session expired (or the token was deactivated).
         updateChatStatus('expired');
         return null;
       }
       if (response.status === 400) {
+        state.chat.pendingSubmission = null;
         // Conversation completed server-side (e.g. reached an end node).
-        updateChatStatus('ended', 'Conversation ended.');
+        updateChatStatus('ended', widgetText('conversationEndedText'));
         return null;
       }
       throw new Error(`Chat message failed: ${response.status}`);
     } catch (error) {
       console.error('Dograh Widget: Failed to send message', error);
       state.chat.pendingUserText = null;
-      state.chat.draft = trimmed;
-      updateChatStatus('ready', 'Message not sent — please try again.');
+      await recoverChatSession();
       if (state.callbacks.onError) {
         state.callbacks.onError(error);
       }
@@ -1984,7 +2179,7 @@
     if (!state.sessionToken || state.chat.status === 'ended' || state.chat.status === 'expired') {
       return state.chat.turns.slice();
     }
-    if (state.chat.status === 'starting' || state.chat.status === 'waiting' || state.chat.ending) {
+    if (state.chat.status === 'starting' || state.chat.status === 'waiting' || state.chat.status === 'recovering' || state.chat.ending) {
       return null;
     }
 
@@ -2009,7 +2204,7 @@
         const data = await response.json();
         applyChatSession(data);
         state.chat.ending = false;
-        updateChatStatus('ended', 'Conversation ended.');
+        updateChatStatus('ended', widgetText('conversationEndedText'));
         return state.chat.turns.slice();
       }
 
@@ -2042,7 +2237,7 @@
   }
 
   /**
-   * Refetch the transcript (409 recovery). Marks the session expired on
+   * Refetch the transcript after a conflict or disconnect. Marks it expired on
    * 403/404 so the caller can surface the restart UI.
    */
   async function resyncChatSession() {
@@ -2116,9 +2311,9 @@
       if (turn.user_message && turn.user_message.text) {
         messages.appendChild(buildChatBubble(turn.user_message.text, 'user', turn.status === 'failed'));
       }
-      if (turn.assistant_message && turn.assistant_message.text) {
-        messages.appendChild(buildChatBubble(turn.assistant_message.text, 'assistant', false));
-      }
+      assistantMessages(turn).forEach((message) => {
+        if (message && message.text) messages.appendChild(buildChatBubble(message.text, 'assistant', false));
+      });
     });
 
     if (state.chat.pendingUserText) {
@@ -2170,15 +2365,15 @@
       const restart = document.createElement('button');
       restart.type = 'button';
       restart.className = 'dograh-chat-restart';
-      restart.textContent = 'Start new chat';
+      restart.textContent = widgetText('startNewChatText');
       restart.onclick = startNewChatSession;
       banner.appendChild(restart);
-    } else if (state.chat.status === 'error') {
+    } else if (state.chat.status === 'error' || state.chat.status === 'recovering') {
       const retry = document.createElement('button');
       retry.type = 'button';
       retry.className = 'dograh-chat-restart';
-      retry.textContent = 'Retry';
-      retry.onclick = () => startChatSession();
+      retry.textContent = widgetText('chatRetryText');
+      retry.onclick = () => state.chat.status === 'recovering' ? recoverChatSession() : startChatSession();
       banner.appendChild(retry);
     }
   }
@@ -2209,7 +2404,7 @@
     );
     endBtn.style.display = hasActiveSession ? 'inline-flex' : 'none';
     endBtn.disabled = state.chat.ending || state.chat.confirmingEnd || state.chat.status !== 'ready';
-    endBtn.textContent = state.chat.ending ? 'Ending…' : 'End chat';
+    endBtn.textContent = state.chat.ending ? widgetText('endingChatText') : widgetText('endChatText');
   }
 
   // Public API

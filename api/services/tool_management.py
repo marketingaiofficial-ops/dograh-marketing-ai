@@ -1,7 +1,8 @@
 """Service layer for reusable tool management.
 
-Routes and MCP tools both use this module so validation, credential
-scoping, MCP discovery, and analytics stay consistent.
+Routes and MCP tools both use this module so validation, organization
+scoping of what a definition references, MCP discovery, and analytics stay
+consistent.
 """
 
 from __future__ import annotations
@@ -13,15 +14,15 @@ from loguru import logger
 
 from api.db import db_client
 from api.db.models import UserModel
-from api.enums import PostHogEvent, ToolCategory
+from api.enums import PostHogEvent, ToolCategory, ToolStatus
 from api.schemas.tool import (
     CreatedByResponse,
     CreateToolRequest,
     McpRefreshResponse,
     ToolResponse,
+    UpdateToolRequest,
 )
-from api.services.organization_preferences import external_pbx_integrations_enabled
-from api.services.posthog_client import capture_event
+from api.services.posthog_tenant import capture_tenant_event
 from api.services.workflow.mcp_tool_session import discover_mcp_tools
 from api.services.workflow.tools.mcp_tool import (
     McpDefinitionError,
@@ -100,10 +101,17 @@ async def fetch_credential(credential_uuid: Optional[str], organization_id: int)
         return None
 
 
-async def validate_tool_credential_references(
+async def validate_tool_references(
     definition: dict[str, Any], *, organization_id: int
 ) -> None:
-    """Ensure credential UUID references belong to the caller's organization."""
+    """Ensure everything a definition points at belongs to the caller's org.
+
+    A tool names other resources by id -- a credential to authenticate with,
+    the agent a transfer hands the call to. The id proves the row exists and
+    nothing about who owns it, so each one is fetched under the caller's
+    organization and refused if it comes back empty. Checked here rather than
+    where the tool runs, because there the failure lands mid-call.
+    """
     for credential_uuid in _credential_uuids_from_definition(definition):
         credential = await db_client.get_credential_by_uuid(
             credential_uuid, organization_id
@@ -119,40 +127,36 @@ async def validate_tool_credential_references(
                 status_code=404,
             )
 
+    if definition.get("type") == ToolCategory.TRANSFER_AGENT.value:
+        # Required and typed by `TransferAgentConfig`, so it is an int here.
+        workflow_id = definition["config"]["workflow_id"]
+        if not await db_client.get_workflow(
+            workflow_id, organization_id=organization_id
+        ):
+            raise ToolManagementError(
+                "destination_not_found",
+                (
+                    f"Agent '{workflow_id}' was not found in this organization. "
+                    "A transfer can only hand the call to your own agents."
+                ),
+                status_code=404,
+            )
 
-async def validate_external_pbx_tool_definition(
-    definition: dict[str, Any],
-    *,
-    organization_id: int,
-    existing_definition: Optional[dict[str, Any]] = None,
-) -> None:
-    """Enforce the org feature gate for context-to-in-group routing."""
-
-    config = definition.get("config")
-    existing_config = (existing_definition or {}).get("config")
-    uses_external_pbx = (
-        isinstance(config, dict)
-        and config.get("destination_source") == "context_mapping"
-    )
-    existing_uses_external_pbx = (
-        isinstance(existing_config, dict)
-        and existing_config.get("destination_source") == "context_mapping"
-    )
-    if not uses_external_pbx and not existing_uses_external_pbx:
-        return
-    if await external_pbx_integrations_enabled(organization_id):
-        return
-    if isinstance(existing_config, dict) and existing_config == config:
-        # Preserve a hidden existing mapping while the feature is disabled.
-        return
-    raise ToolManagementError(
-        "external_pbx_feature_disabled",
-        (
-            "External PBX integrations are disabled for this organization. "
-            "Enable them in Platform Settings before configuring in-group routing."
-        ),
-        status_code=403,
-    )
+    recording_ids = {
+        message["recording_id"]
+        for message in definition.get("messages", [])
+        if message.get("type") == "audio"
+    }
+    if recording_ids:
+        accessible_ids = await db_client.get_active_recording_ids(
+            recording_ids, organization_id
+        )
+        if recording_ids != accessible_ids:
+            raise ToolManagementError(
+                "recording_not_found",
+                "A tool message recording was not found in this organization.",
+                status_code=404,
+            )
 
 
 async def populate_discovered_tools(
@@ -180,7 +184,9 @@ async def populate_discovered_tools(
                 timeout_secs=cfg["timeout_secs"],
                 sse_read_timeout_secs=cfg["sse_read_timeout_secs"],
             )
-        except BaseException as e:  # noqa: BLE001
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
             logger.warning(f"MCP discovery failed; caching empty list: {e}")
             return []
 
@@ -194,6 +200,7 @@ async def create_tool_for_user(
     user: UserModel,
     *,
     source: str = "api",
+    operation_id: str | None = None,
 ) -> ToolResponse:
     """Create a reusable tool for the authenticated user's selected org."""
     if not user.selected_organization_id:
@@ -203,11 +210,15 @@ async def create_tool_for_user(
             status_code=400,
         )
 
+    if operation_id is not None:
+        previous = await db_client.get_tool_mutation_receipt(
+            operation_id, user.selected_organization_id
+        )
+        if previous is not None:
+            return build_tool_response(previous)
+
     definition = request.definition.model_dump()
-    await validate_external_pbx_tool_definition(
-        definition, organization_id=user.selected_organization_id
-    )
-    await validate_tool_credential_references(
+    await validate_tool_references(
         definition, organization_id=user.selected_organization_id
     )
     definition = await populate_discovered_tools(
@@ -224,16 +235,133 @@ async def create_tool_for_user(
         description=request.description,
         icon=request.icon,
         icon_color=request.icon_color,
+        **({"operation_id": operation_id} if operation_id is not None else {}),
     )
 
-    capture_event(
+    await capture_tenant_event(
         distinct_id=str(user.provider_id),
         event=PostHogEvent.TOOL_CREATED,
+        organization_id=user.selected_organization_id,
         properties={
             "tool_name": request.name,
             "tool_category": request.category,
             "source": source,
-            "organization_id": user.selected_organization_id,
+        },
+    )
+
+    return build_tool_response(tool)
+
+
+async def get_tool_for_user(
+    tool_uuid: str,
+    user: UserModel,
+    *,
+    include_archived: bool = True,
+) -> ToolResponse:
+    """Read one tool's full definition for the user's selected org."""
+    if not user.selected_organization_id:
+        raise ToolManagementError(
+            "organization_required",
+            "No organization selected for the user",
+            status_code=400,
+        )
+
+    tool = await db_client.get_tool_by_uuid(
+        tool_uuid, user.selected_organization_id, include_archived=include_archived
+    )
+    if not tool:
+        raise ToolManagementError("tool_not_found", "Tool not found", status_code=404)
+
+    return build_tool_response(tool, include_created_by=True)
+
+
+async def update_tool_for_user(
+    tool_uuid: str,
+    request: UpdateToolRequest,
+    user: UserModel,
+    *,
+    source: str = "api",
+    operation_id: str | None = None,
+) -> ToolResponse:
+    """Apply a partial update to a tool in the user's selected org.
+
+    `definition`, when given, is the FULL replacement definition -- not a
+    field-level patch: read the tool first, change what you need, and send the
+    whole definition back. Its `type` must equal the tool's existing category,
+    because a tool cannot change category and the runtime dispatches on it.
+    Reference checks and MCP discovery mirror `create_tool_for_user`.
+    """
+    if not user.selected_organization_id:
+        raise ToolManagementError(
+            "organization_required",
+            "No organization selected for the user",
+            status_code=400,
+        )
+
+    if operation_id is not None:
+        previous = await db_client.get_tool_mutation_receipt(
+            operation_id, user.selected_organization_id
+        )
+        if previous is not None:
+            return build_tool_response(previous)
+
+    existing = await db_client.get_tool_by_uuid(
+        tool_uuid, user.selected_organization_id, include_archived=True
+    )
+    if not existing:
+        raise ToolManagementError("tool_not_found", "Tool not found", status_code=404)
+
+    if request.status is not None:
+        valid_statuses = [s.value for s in ToolStatus]
+        if request.status not in valid_statuses:
+            raise ToolManagementError(
+                "validation_error",
+                f"Invalid status '{request.status}'. Must be one of: "
+                f"{', '.join(valid_statuses)}.",
+            )
+
+    definition = None
+    if request.definition is not None:
+        definition = request.definition.model_dump()
+        if definition.get("type") != existing.category:
+            raise ToolManagementError(
+                "category_mismatch",
+                (
+                    f"This tool's category is '{existing.category}', and a tool "
+                    f"cannot change category. The supplied definition has type "
+                    f"'{definition.get('type')}'. Create a new tool instead."
+                ),
+            )
+        await validate_tool_references(
+            definition, organization_id=user.selected_organization_id
+        )
+        definition = await populate_discovered_tools(
+            definition,
+            organization_id=user.selected_organization_id,
+        )
+
+    tool = await db_client.update_tool(
+        tool_uuid=tool_uuid,
+        organization_id=user.selected_organization_id,
+        name=request.name,
+        description=request.description,
+        definition=definition,
+        icon=request.icon,
+        icon_color=request.icon_color,
+        status=request.status,
+        **({"operation_id": operation_id} if operation_id is not None else {}),
+    )
+    if not tool:
+        raise ToolManagementError("tool_not_found", "Tool not found", status_code=404)
+
+    await capture_tenant_event(
+        distinct_id=str(user.provider_id),
+        event=PostHogEvent.TOOL_UPDATED,
+        organization_id=user.selected_organization_id,
+        properties={
+            "tool_name": tool.name,
+            "tool_category": tool.category,
+            "source": source,
         },
     )
 

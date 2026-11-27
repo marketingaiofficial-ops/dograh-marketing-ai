@@ -12,14 +12,15 @@ import type { ReactNode } from "react";
 import { BrandLogo } from "@/components/BrandLogo";
 
 const HIGHLIGHTS = [
-  "Speech-to-speech",
-  "MCP-native",
-  "BYOK - any model",
+  "Phone calls",
+  "Campaigns",
+  "Any model or voice",
 ];
 
+// `enterpriseSlot` is still accepted so upstream callers compile, but
+// YourVoiceOS doesn't show the enterprise CTA block.
 export function AuthShell({
   children,
-  enterpriseSlot,
 }: {
   children: ReactNode;
   enterpriseSlot?: ReactNode;
@@ -55,7 +56,7 @@ export function AuthShell({
 
         <div className="relative max-w-md space-y-5">
           <h1 className="text-3xl font-semibold leading-tight tracking-tight text-zinc-50 xl:text-4xl">
-            The open-source voice AI platform.
+            Build, test and run your voice AI agents.
           </h1>
           <ul className="flex flex-wrap gap-2">
             {HIGHLIGHTS.map((point) => (
@@ -69,18 +70,8 @@ export function AuthShell({
           </ul>
         </div>
 
-        {/* Enterprise CTA block (Bland-style) — bottom margin lifts it off the
-            viewport edge while justify-between keeps the column layout */}
-        <div className="relative mb-12 max-w-md space-y-3 rounded-xl border border-white/10 bg-white/[0.03] p-5 xl:mb-16">
-          <h2 className="text-sm font-semibold text-zinc-100">
-            Need on-prem, data residency &amp; a data perimeter?
-          </h2>
-          <p className="text-sm text-zinc-400">
-            We deploy Dograh inside your environment for regulated and
-            high-scale teams.
-          </p>
-          {enterpriseSlot}
-        </div>
+        {/* YourVoiceOS: no upstream enterprise CTA block; spacer keeps the layout. */}
+        <div className="relative" />
       </aside>
     </div>
   );

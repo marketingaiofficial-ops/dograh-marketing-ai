@@ -19,7 +19,11 @@ from api.errors.failure import (
 )
 from api.services.configuration.masking import mask_key
 from api.utils.credential_auth import build_auth_header
-from api.utils.template_renderer import render_template, render_url_template
+from api.utils.template_renderer import (
+    get_nested_value,
+    render_template,
+    render_url_template,
+)
 from api.utils.url_security import validate_user_configured_service_url
 
 # Map tool parameter types to JSON schema types
@@ -30,6 +34,8 @@ TYPE_MAP = {
     "object": "object",
     "array": "array",
 }
+
+_FULL_PLACEHOLDER = re.compile(r"^\{\{\s*([^|\s}]+)(?:\s*\|[^}]*)?\s*\}\}$")
 
 
 def custom_tool_function_name(name: str) -> str:
@@ -49,6 +55,27 @@ def serialize_query_params(arguments: dict[str, Any]) -> dict[str, Any]:
         k: json.dumps(v) if isinstance(v, (dict, list)) else v
         for k, v in arguments.items()
     }
+
+
+def serialize_form_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Prepare a request body for application/x-www-form-urlencoded encoding.
+
+    Form fields are flat. A top-level list stays a list so httpx repeats the
+    key once per item (``To=a&To=b``); objects, and anything nested inside a
+    list, are JSON-stringified because the format has no nesting.
+    """
+
+    def encode(value: Any) -> Any:
+        return json.dumps(value) if isinstance(value, (dict, list)) else value
+
+    return {
+        k: [encode(item) for item in v] if isinstance(v, list) else encode(v)
+        for k, v in body.items()
+    }
+
+
+def _without_content_type(headers: dict[str, str]) -> dict[str, str]:
+    return {k: v for k, v in headers.items() if k.lower() != "content-type"}
 
 
 def tool_to_function_schema(tool: Any) -> dict[str, Any]:
@@ -248,6 +275,26 @@ def _resolve_preset_parameters(
     return resolved
 
 
+def render_body_template(template: Any, context: dict[str, Any]) -> Any:
+    """Render a JSON template while preserving whole-placeholder value types."""
+    if isinstance(template, dict):
+        return {
+            render_template(str(key), context): render_body_template(value, context)
+            for key, value in template.items()
+        }
+    if isinstance(template, list):
+        return [render_body_template(value, context) for value in template]
+    if not isinstance(template, str):
+        return template
+
+    match = _FULL_PLACEHOLDER.fullmatch(template)
+    if match:
+        value = get_nested_value(context, match.group(1))
+        if value is not None and not isinstance(value, str):
+            return value
+    return render_template(template, context)
+
+
 async def execute_http_tool(
     tool: Any,
     arguments: dict[str, Any],
@@ -279,6 +326,10 @@ async def execute_http_tool(
     # Get HTTP method and URL
     method = config.get("method", "POST").upper()
     url = config.get("url", "")
+
+    # GET and DELETE send no body, so the body format must not touch them.
+    sends_body = method in ("POST", "PUT", "PATCH")
+    form_encoded = sends_body and config.get("body_format", "json") == "form"
 
     # Get headers from config
     headers = dict(config.get("headers", {}) or {})
@@ -323,6 +374,13 @@ async def execute_http_tool(
                 tool_name=tool.name,
             )
 
+    if form_encoded:
+        # The body format owns the Content-Type. A JSON one kept in the tool's
+        # headers from before the format was switched, or set by a credential
+        # shared with a JSON tool, would make the server misread the body.
+        headers = _without_content_type(headers)
+        credential_headers = _without_content_type(credential_headers)
+
     request_headers: dict[str, str] = {}
     if include_request_headers:
         request_headers = {str(name): str(value) for name, value in headers.items()}
@@ -330,6 +388,7 @@ async def execute_http_tool(
             request_headers[header_name] = mask_key(str(header_value))
 
     _rendered_url: str | None = None
+    _request_body_preview: Any = None
 
     def build_result(result: dict[str, Any]) -> dict[str, Any]:
         if include_request_headers:
@@ -337,6 +396,7 @@ async def execute_http_tool(
                 **result,
                 "request_headers": request_headers,
                 "rendered_url": _rendered_url,
+                "request_body_preview": _request_body_preview,
             }
         return result
 
@@ -405,15 +465,25 @@ async def execute_http_tool(
             {"status": "error", "error": f"URL validation failed: {e!s}"}
         )
 
-    request_arguments = resolved_arguments
-
-    # Build request: JSON body for POST/PUT/PATCH, query params for GET/DELETE
+    # Build request: body for POST/PUT/PATCH, query params for GET/DELETE
     body = None
     params = None
-    if method in ("POST", "PUT", "PATCH"):
-        body = request_arguments
-    elif method in ("GET", "DELETE") and request_arguments:
-        params = serialize_query_params(request_arguments)
+    if sends_body:
+        body_template = config.get("body_template")
+        if body_template is None:
+            body = resolved_arguments
+        else:
+            body = render_body_template(
+                body_template,
+                {
+                    **resolved_arguments,
+                    "initial_context": initial_context,
+                    "gathered_context": gathered_context,
+                },
+            )
+        _request_body_preview = body
+    elif method in ("GET", "DELETE") and resolved_arguments:
+        params = serialize_query_params(resolved_arguments)
 
     logger.info(
         f"Executing custom tool '{tool.name}' ({tool.tool_uuid}): "
@@ -423,15 +493,14 @@ async def execute_http_tool(
         logger.debug(
             f"Resolved preset parameters for '{tool.name}': {list(preset_arguments.keys())}"
         )
-    logger.debug(f"Request body: {body}, params: {params}")
-
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.request(
                 method=method,
                 url=url,
                 headers=headers,
-                json=body,
+                json=None if form_encoded else body,
+                data=serialize_form_body(body) if form_encoded and body else None,
                 params=params,
             )
 
@@ -442,7 +511,7 @@ async def execute_http_tool(
                 response_data = {"raw_response": response.text}
 
             result = {
-                "status": "success",
+                "status": "error" if response.status_code >= 400 else "success",
                 "status_code": response.status_code,
                 "data": response_data,
             }
