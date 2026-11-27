@@ -47,84 +47,81 @@
 }
 
 :root {
-  --radius: 0.625rem;
+  /* YourVoiceOS light theme (only used when the person switches to light). */
+  --radius: 0.375rem;
+  --background: oklch(0.985 0.003 250);
+  --foreground: oklch(0.23 0.015 250);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
+  --card-foreground: oklch(0.23 0.015 250);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
-  --chart-1: oklch(0.646 0.222 41.116);
-  --chart-2: oklch(0.6 0.118 184.704);
-  --chart-3: oklch(0.398 0.07 227.392);
-  --chart-4: oklch(0.828 0.189 84.429);
-  --chart-5: oklch(0.769 0.188 70.08);
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  /* Single restrained warm accent — used only on primary CTAs + focus rings. */
-  --cta: oklch(0.72 0.15 65);
-  --cta-foreground: oklch(0.16 0.02 60);
-  /* Giant faded "dograh" wordmark (authentic Proxima Nova letterforms traced
-     from the brand logo PNG — the font is commercial, so the lettering ships
-     as static artwork in /public; fill + 0.9% opacity are baked into the
-     files). Theme-switched here; consumed by .app-surface and .auth-imprint. */
-  --brand-imprint: url("/brand-imprint-light.svg");
+  --popover-foreground: oklch(0.23 0.015 250);
+  --primary: oklch(0.48 0.115 225);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.94 0.008 250);
+  --secondary-foreground: oklch(0.23 0.015 250);
+  --muted: oklch(0.955 0.006 250);
+  --muted-foreground: oklch(0.47 0.02 250);
+  --accent: oklch(0.93 0.025 225);
+  --accent-foreground: oklch(0.25 0.05 225);
+  --destructive: oklch(0.53 0.2 25);
+  --border: oklch(0.86 0.01 250);
+  --input: oklch(0.86 0.01 250);
+  --ring: oklch(0.48 0.115 225 / 60%);
+  --chart-1: oklch(0.48 0.115 225);
+  --chart-2: oklch(0.52 0.17 5);
+  --chart-3: oklch(0.48 0.1 75);
+  --chart-4: oklch(0.5 0.16 320);
+  --chart-5: oklch(0.53 0.2 25);
+  --sidebar: oklch(0.965 0.005 250);
+  --sidebar-foreground: oklch(0.23 0.015 250);
+  --sidebar-primary: oklch(0.48 0.115 225);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.93 0.025 225);
+  --sidebar-accent-foreground: oklch(0.25 0.05 225);
+  --sidebar-border: oklch(0.86 0.01 250);
+  --sidebar-ring: oklch(0.48 0.115 225 / 60%);
+  --cta: oklch(0.48 0.115 225);
+  --cta-foreground: oklch(0.99 0 0);
+  /* YourVoiceOS has no giant faded wordmark behind pages. */
+  --brand-imprint: none;
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.488 0.243 264.376);
-  --chart-2: oklch(0.696 0.17 162.48);
-  --chart-3: oklch(0.769 0.188 70.08);
-  --chart-4: oklch(0.627 0.265 303.9);
-  --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
-  /* Warm accent, slightly brighter against the near-black surfaces. */
-  --cta: oklch(0.78 0.16 67);
-  --cta-foreground: oklch(0.16 0.02 60);
-  --brand-imprint: url("/brand-imprint-dark.svg");
+  /* YourVoiceOS dark theme (the default). */
+  --background: oklch(0.16 0.008 250);
+  --foreground: oklch(0.93 0.01 250);
+  --card: oklch(0.195 0.009 250);
+  --card-foreground: oklch(0.93 0.01 250);
+  --popover: oklch(0.21 0.01 250);
+  --popover-foreground: oklch(0.93 0.01 250);
+  --primary: oklch(0.82 0.12 225);
+  --primary-foreground: oklch(0.18 0.025 225);
+  --secondary: oklch(0.25 0.01 250);
+  --secondary-foreground: oklch(0.93 0.01 250);
+  --muted: oklch(0.23 0.01 250);
+  --muted-foreground: oklch(0.66 0.015 250);
+  --accent: oklch(0.26 0.035 225);
+  --accent-foreground: oklch(0.95 0.01 250);
+  --destructive: oklch(0.65 0.2 25);
+  --border: oklch(0.3 0.012 250);
+  --input: oklch(0.3 0.012 250);
+  --ring: oklch(0.82 0.12 225 / 60%);
+  --chart-1: oklch(0.82 0.12 225);
+  --chart-2: oklch(0.75 0.17 5);
+  --chart-3: oklch(0.82 0.15 75);
+  --chart-4: oklch(0.7 0.16 320);
+  --chart-5: oklch(0.65 0.2 25);
+  --sidebar: oklch(0.135 0.008 250);
+  --sidebar-foreground: oklch(0.9 0.01 250);
+  --sidebar-primary: oklch(0.82 0.12 225);
+  --sidebar-primary-foreground: oklch(0.18 0.025 225);
+  --sidebar-accent: oklch(0.22 0.035 225);
+  --sidebar-accent-foreground: oklch(0.95 0.01 250);
+  --sidebar-border: oklch(0.26 0.01 250);
+  --sidebar-ring: oklch(0.82 0.12 225 / 60%);
+  --cta: oklch(0.82 0.12 225);
+  --cta-foreground: oklch(0.18 0.025 225);
+  --brand-imprint: none;
 }
 
 @layer base {
@@ -238,7 +235,7 @@
      paints inside .app-surface, which starts right of the ~270px sidebar —
      the +135px x-shift recentres the wordmark on the VISIBLE canvas. */
   .app-surface {
-    background-color: oklch(0.984 0.001 80);
+    background-color: var(--background);
     background-image: var(--brand-imprint);
     background-size: min(68vw, 980px) auto;
     background-position: calc(50% + 135px) calc(100% - 24px);
@@ -252,7 +249,7 @@
     }
   }
   .dark .app-surface {
-    background-color: oklch(0.165 0.002 80);
+    background-color: var(--background);
   }
 
   /* Giant faded "dograh" imprint for the auth pages (applied to the AuthShell

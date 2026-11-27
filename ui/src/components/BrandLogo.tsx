@@ -1,11 +1,10 @@
 import { cn } from "@/lib/utils";
 
-// Reusable Dograh wordmark. Theme-aware by default: the dark logo shows on light
-// surfaces and the light/cream logo shows on dark. Pass `inverse` to force the
-// light logo on an always-dark surface (e.g. the auth brand panel). Pass `mark`
-// to render the square logo mark instead of the full wordmark (e.g. the app
-// sidebar header). Height is controlled by the caller via className (e.g.
-// "h-7"); width stays auto so each lockup keeps its aspect ratio.
+// YourVoiceOS brand lockup: the app icon plus the "YourVoiceOS" wordmark in the
+// mono font, matching the original YourVoiceOS app. `mark` renders the icon only
+// (collapsed sidebar). `inverse` is kept for callers that sit on an always-dark
+// surface; the lockup reads on both themes, so it only forces light text.
+// Height is controlled by the caller via className (e.g. "h-7").
 export function BrandLogo({
   className,
   inverse = false,
@@ -15,24 +14,15 @@ export function BrandLogo({
   inverse?: boolean;
   mark?: boolean;
 }) {
+  // eslint-disable-next-line @next/next/no-img-element
+  const icon = <img src="/yourvoiceos-icon.png" alt="YourVoiceOS" className={cn("w-auto shrink-0 select-none rounded-md object-contain", className)} />;
   if (mark) {
-    return (
-      // eslint-disable-next-line @next/next/no-img-element
-      <img src="/dograh-mark.png" alt="Dograh" className={cn("w-auto select-none", className)} />
-    );
-  }
-  if (inverse) {
-    return (
-      // eslint-disable-next-line @next/next/no-img-element
-      <img src="/dograh-logo-inverse.png" alt="Dograh" className={cn("w-auto select-none", className)} />
-    );
+    return icon;
   }
   return (
-    <>
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src="/dograh-logo.png" alt="Dograh" className={cn("block w-auto select-none dark:hidden", className)} />
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src="/dograh-logo-inverse.png" alt="Dograh" className={cn("hidden w-auto select-none dark:block", className)} />
-    </>
+    <span className={cn("inline-flex items-center gap-2.5 font-mono font-medium", inverse && "text-white")}>
+      {icon}
+      <span>YourVoiceOS</span>
+    </span>
   );
 }
